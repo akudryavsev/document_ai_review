@@ -149,6 +149,13 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Веса моделей для llama-server
+models/*
+!models/.gitkeep
+
+# Локальные эксперименты: документы, debug, чанки, results
+experiments/
+
 # Environments
 .env
 .envrc

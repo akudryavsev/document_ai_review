@@ -1,0 +1,28 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: ["sleep", "infinity"]
+
+  inference:
+    profiles: ["poc"]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    gpus: all
+    volumes:
+      - ./models:/models
+      - ./deploy/llama/models.ini:/etc/llama/models.ini:ro
+    command:
+      - --models-preset
+      - /etc/llama/models.ini
+      - --models-max
+      - "1"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    expose:
+      - "8080"

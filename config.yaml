@@ -1,0 +1,94 @@
+# Пример конфига для проверки разбора документов на чанки (фаза A1).
+# Всё для экспериментов лежит в ./experiments/ (каталог в .gitignore).
+# Документы: положите .docx / .pdf в ./experiments/documents
+# Запуск: python main.py run --config config.yaml --phase A1
+#
+# Вопросы для одного A1 не нужны (см. docs/specs/1. top-level-classes.md).
+# Путь questions_file оставлен для полных прогонов A2/B.
+
+input:
+  documents_dir: "./experiments/documents"
+  questions_file: "./experiments/questions.json"
+
+extraction:
+  pdf_text_layer_required: true
+  debug_dump: true
+
+chunking:
+  max_tokens: 800
+  overlap_tokens: 100
+  min_chunk_tokens: 100
+  preserve_section_path: true
+
+inference:
+  base_url: "http://inference:8080"
+  request_timeout_sec: 120
+  poll_interval_sec: 0.5
+
+embedding:
+  model: "embed"
+  batch_size: 8
+  dtype: "fp16"
+  device: "cuda:0"
+  cache_dir: "./experiments/emb"
+  questions_cache: "./experiments/questions.parquet"
+  persist_chunk_index: true
+  persist_bm25: false
+
+retrieval:
+  top_k: 20
+  # 0 — не резать по fused_score, только top_k. Поднять, когда шкала модели замерена.
+  score_threshold: 0
+  query_strategy: "max_over_variants"
+  hybrid:
+    enabled: true
+    bm25_weight: 0.3
+    vector_weight: 0.7
+  persist_candidates: true
+
+reranker:
+  enabled: true
+  model: "rerank"
+  top_n: 5
+  # 0 — в сборку всегда top_n лучших. Поднять для отсечения слабых скоров.
+  score_threshold: 0
+  device: "cuda:0"
+
+verification:
+  enabled: true
+  model: "small-llm"
+  batch_size: 8
+  device: "auto"
+
+context:
+  expansion: "section"
+  neighbors_fallback: 2
+  max_total_tokens: 6000
+  max_section_tokens: 3000
+  # 0 — ранний выход выключен. Поднять: max rerank < порога → empty_search=true
+  early_exit_threshold: 0
+  compression: none
+
+answer:
+  model: "answer"
+  device: "auto"
+  temperature: 0
+  max_output_tokens: 800
+  require_citations: true
+
+phases:
+  run_a1: true
+  run_a2: false
+  run_b: false
+  contexts_dir: "./experiments/contexts"
+  index_dir: "./experiments/index"
+  skip_if_artifacts_valid: true
+
+runtime:
+  retries: 2
+  retry_pause_sec: 0
+  question_parallelism: 1
+  results_dir: "./experiments/results"
+  log_level: "INFO"
+  # Корень артефактов A1 и debug: emb/, debug/, questions.*
+  cache_dir: "./experiments"

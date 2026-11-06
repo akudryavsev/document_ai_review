@@ -1,0 +1,6 @@
+pydantic>=2
+pyyaml
+pytest
+python-docx
+pypdf
+pymorphy3
