@@ -9,7 +9,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
-from models.model_list import ModelListResolver
+from models.model_list import ModelListResolver, ModelPreset, ModelPresetNormalizer
 
 
 class InputConfig(BaseModel):
@@ -58,6 +58,7 @@ class EmbeddingConfig(BaseModel):
     Attributes:
         model: Имя файла текущей комбинации. Первый элемент models.
         models: Имена GGUF в каталоге models/. Одно имя — список из одного.
+        entries: Записи с params в порядке YAML. Пусто, если список задан именами.
         batch_size: Размер батча.
         dtype: Тип данных на устройстве.
         device: Устройство загрузки.
@@ -69,6 +70,7 @@ class EmbeddingConfig(BaseModel):
 
     model: str | None = Field(default=None, exclude=True)
     models: list[str] | None = None
+    entries: list[ModelPreset] = Field(default_factory=list)
     batch_size: int = 8
     dtype: str = "fp16"
     device: str = "cuda:0"
@@ -154,7 +156,9 @@ class RerankerConfig(BaseModel):
         enabled: Включён ли реранкер.
         model: Имя файла текущей комбинации. Первый элемент models.
         models: Имена GGUF реранкеров.
+        entries: Записи с params в порядке YAML. Пусто, если список задан именами.
         top_n: Число кандидатов после реранка.
+        query_strategy: Запросы реранка: category или synonyms_rerank.
         score_threshold: Порог реранка; 0 выключает отсечение.
         device: Устройство загрузки.
     """
@@ -162,7 +166,9 @@ class RerankerConfig(BaseModel):
     enabled: bool = True
     model: str | None = Field(default=None, exclude=True)
     models: list[str] | None = None
+    entries: list[ModelPreset] = Field(default_factory=list)
     top_n: int = 5
+    query_strategy: str = "category"
     score_threshold: float = 0.0
     device: str = "cuda:0"
 
@@ -199,6 +205,23 @@ class RerankerConfig(BaseModel):
         current, names = ModelListResolver("rerank").resolve(self.model, self.models)
         self.model = current
         self.models = names
+        return self
+
+    @model_validator(mode="after")
+    def check_query_strategy(self) -> RerankerConfig:
+        """Проверяет допустимые значения query_strategy.
+
+        Returns:
+            Тот же конфиг.
+
+        Raises:
+            ValueError: Стратегия не category и не synonyms_rerank.
+        """
+        allowed = {"category", "synonyms_rerank"}
+        if self.query_strategy not in allowed:
+            raise ValueError(
+                f"Неподдерживаемая reranker.query_strategy: {self.query_strategy}"
+            )
         return self
 
 
@@ -244,6 +267,7 @@ class AnswerConfig(BaseModel):
     Attributes:
         model: Имя файла текущей комбинации. Первый элемент models.
         models: Имена GGUF моделей ответа.
+        entries: Записи с params в порядке YAML. Пусто, если список задан именами.
         device: Устройство загрузки.
         temperature: Температура генерации.
         max_output_tokens: Лимит токенов ответа.
@@ -252,6 +276,7 @@ class AnswerConfig(BaseModel):
 
     model: str | None = Field(default=None, exclude=True)
     models: list[str] | None = None
+    entries: list[ModelPreset] = Field(default_factory=list)
     device: str = "auto"
     temperature: float = 0
     max_output_tokens: int = 800
@@ -335,7 +360,8 @@ class RuntimeConfig(BaseModel):
         retry_pause_sec: Пауза между попытками, секунды.
         question_parallelism: Параллелизм вопросов (в PoC = 1).
         results_dir: Каталог результатов.
-        log_level: Уровень логов.
+        log_level: Уровень логгера observe.trace.
+            Допустимы DEBUG, INFO, WARNING, ERROR, CRITICAL.
         cache_dir: Корень отладочных дампов и артефактов (.cache).
     """
 
@@ -359,6 +385,56 @@ class RuntimeConfig(BaseModel):
         if self.retries < 1:
             raise ValueError("runtime.retries должен быть не меньше 1")
         return self
+
+    @model_validator(mode="after")
+    def validate_log_level(self) -> RuntimeConfig:
+        """Проверяет имя уровня до старта фаз.
+
+        Returns:
+            Тот же конфиг.
+
+        Raises:
+            ValueError: Имя не из DEBUG, INFO, WARNING, ERROR, CRITICAL.
+        """
+        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        if self.log_level not in allowed:
+            names = ", ".join(sorted(allowed))
+            raise ValueError(f"runtime.log_level должен быть одним из: {names}")
+        return self
+
+
+class UniqueYamlLoader(yaml.SafeLoader):
+    """SafeLoader, который отвергает повтор ключа в одном объекте."""
+
+    def construct_mapping(self, node: yaml.Node, deep: bool = False) -> dict[str, Any]:
+        """Собирает объект YAML и не затирает уже встреченный ключ.
+
+        Args:
+            node: Узел объекта.
+            deep: Разбирать вложенные узлы сразу.
+
+        Returns:
+            Словарь в порядке ключей файла.
+
+        Raises:
+            ValueError: Ключ в этом объекте уже был.
+            yaml.YAMLError: Узел не объект.
+        """
+        if not isinstance(node, yaml.MappingNode):
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "expected a mapping node",
+                node.start_mark,
+            )
+        self.flatten_mapping(node)
+        mapping: dict[str, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise ValueError(f"повтор ключа {key}")
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
 
 
 class AppConfig(BaseModel):
@@ -416,14 +492,23 @@ class AppConfig(BaseModel):
     def from_yaml(cls, path: str | Path) -> AppConfig:
         """Читает YAML и возвращает проверенный конфиг.
 
+        Записи моделей приводятся к именам и entries до валидации полей.
+        Повтор ключа в файле — ошибка, а не тихое затирание.
+
         Args:
             path: Путь к YAML-файлу.
 
         Returns:
             Экземпляр AppConfig.
+
+        Raises:
+            ValueError: Корень не объект, повтор ключа или плохая запись модели.
         """
         raw_text = Path(path).read_text(encoding="utf-8")
-        payload: dict[str, Any] = yaml.safe_load(raw_text) or {}
+        payload = yaml.load(raw_text, Loader=UniqueYamlLoader) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("корень конфига — объект")
+        ModelPresetNormalizer().apply(payload)
         return cls.model_validate(payload)
 
     @property
@@ -461,10 +546,11 @@ class AppConfig(BaseModel):
         """Хеш параметров реранкера для инвалидации A2.
 
         Returns:
-            sha256 от model, top_n и score_threshold.
+            sha256 от model, top_n, score_threshold и query_strategy.
         """
         reranker = self.reranker
         material = (
-            f"{reranker.model}+{reranker.top_n}+{reranker.score_threshold}"
+            f"{reranker.model}+{reranker.top_n}+{reranker.score_threshold}+"
+            f"{reranker.query_strategy}"
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()

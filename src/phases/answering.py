@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from answer.debug_dump import AnswerDebugDump
+from answer.exchange import ModelAttempt
 from models.artifacts import AnswerRecord, ArtifactMeta
 from models.phases import (
     DocumentPhaseOutcome,
@@ -27,6 +29,7 @@ class AnsweringPhase(Phase):
     Пустой поиск закрывает генератор без LLM.
 
     Attributes:
+        trace_stage: Имя фазы в событии отказа документа.
         llm: LlmGateway.
         verifier: AnswerVerifier или None. В первом запуске в граф не входит
             и не вызывается.
@@ -36,7 +39,10 @@ class AnsweringPhase(Phase):
         gate: ArtifactGate.
         lease: GpuLease.
         trace_sink: TraceSink.
+        answer_dump: Дамп промпта, попыток и итога пары.
     """
+
+    trace_stage = "B"
 
     def __init__(
         self,
@@ -48,6 +54,7 @@ class AnsweringPhase(Phase):
         lease: GpuLease,
         trace_sink: TraceSink,
         verifier: AnswerVerifier | None = None,
+        answer_dump: AnswerDebugDump | None = None,
     ) -> None:
         """Сохраняет порты фазы.
 
@@ -60,6 +67,7 @@ class AnsweringPhase(Phase):
             gate: ArtifactGate.
             lease: GpuLease.
             trace_sink: TraceSink.
+            answer_dump: Дамп или None.
         """
         self.llm = llm
         self.verifier = verifier
@@ -69,6 +77,7 @@ class AnsweringPhase(Phase):
         self.gate = gate
         self.lease = lease
         self.trace_sink = trace_sink
+        self.answer_dump = answer_dump
 
     def plan(self, context: PhaseContext) -> PhasePlan:
         """Решает compute/skip по meta ответов и upstream-хешам.
@@ -92,6 +101,25 @@ class AnsweringPhase(Phase):
             )
             items.append(PhasePlanItem(document=document, decision=decision))
         return PhasePlan(phase="B", items=items)
+
+    def _write_answer_debug(
+        self,
+        record: AnswerRecord,
+        prompt: str | None,
+        attempts: list[ModelAttempt],
+    ) -> None:
+        """Пишет отладочные файлы пары, если дамп включён.
+
+        Args:
+            record: Итог пары.
+            prompt: Промпт или None, если модель не вызывалась.
+            attempts: Попытки. Пустой список файл не создаёт.
+        """
+        if self.answer_dump is None:
+            return
+        self.answer_dump.write_pair(record)
+        self.answer_dump.write_prompt(record.doc_id, record.question_id, prompt)
+        self.answer_dump.write_attempts(record.doc_id, record.question_id, attempts)
 
     @Observed(stage="answering_execute")
     def execute(self, plan: PhasePlan, context: PhaseContext) -> PhaseReport:
@@ -149,6 +177,7 @@ class AnsweringPhase(Phase):
                         answer_model=answer_name,
                     )
                     self.result_sink.write_answer(record)
+                    self._write_answer_debug(record, None, [])
                     continue
                 # Первый запуск не фильтрует фрагменты: verify не вызывается.
                 record = self.generator.generate(
@@ -157,18 +186,16 @@ class AnsweringPhase(Phase):
                     context.questions,
                 )
                 self.result_sink.write_answer(record)
+                exchange = getattr(self.generator, "exchange", None)
+                prompt = None if exchange is None else exchange.prompt
+                attempts = [] if exchange is None else list(exchange.attempts)
+                self._write_answer_debug(record, prompt, attempts)
                 if record.status == "failed":
                     pair_failures += 1
                     doc_failed = True
             if doc_failed and pair_failures == len(questions):
                 failed += 1
-                outcomes.append(
-                    DocumentPhaseOutcome(
-                        doc_id=doc_id,
-                        status="failed",
-                        reason="pairs_failed",
-                    )
-                )
+                outcomes.append(self.fail_document(doc_id, "pairs_failed"))
             else:
                 computed += 1
                 outcomes.append(

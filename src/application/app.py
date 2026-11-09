@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from answer.debug_dump import AnswerDebugDump
 from answer.generator import AnswerGenerator as DocumentAnswerGenerator
 from application.result_sink import FileResultSink
 from application.service import DocumentAnalysisService
+from chunking.debug_dump import ChunkDebugDump
 from chunking.chunker import Chunker as DocumentChunker
 from context.assembler import ContextAssembler as DocumentContextAssembler
 from clean.text_cleaner import Cleaner as DocumentCleaner
@@ -52,11 +54,13 @@ class Application:
         Извлечение, очистка, чанкинг, хранилище, поиск и ответ — боевые.
         Три шлюза ходят в один контейнер. Верификатор в граф не входит.
         Источники документов и вопросов — файловые.
+        Логгер трассы получает runtime.log_level.
 
         Returns:
             DocumentAnalysisService.
         """
         trace_sink = LoggingTraceSink()
+        trace_sink.configure(self.config.runtime.log_level)
         lease = GpuLease(trace_sink)
         store = FileArtifactStore(
             cache_dir=self.config.runtime.cache_dir,
@@ -89,6 +93,12 @@ class Application:
         )
         vector_index = StoreEmbeddingIndex()
         result_sink = FileResultSink(self.config.runtime.results_dir)
+        debug_on = self.config.runtime.log_level == "DEBUG"
+        cache_dir = self.config.runtime.cache_dir
+        retrieval_dump = RetrievalDebugDump(
+            enabled=self.config.retrieval.debug_dump or debug_on,
+            cache_dir=cache_dir,
+        )
         indexing = IndexingPhase(
             extractor=FormatAwareExtractor(
                 pdf_extractor=PdfExtractor(
@@ -104,15 +114,13 @@ class Application:
             gate=gate,
             lease=lease,
             trace_sink=trace_sink,
+            chunk_dump=ChunkDebugDump(enabled=debug_on, cache_dir=cache_dir),
         )
         retrieval = RetrievalPhase(
             retriever=HybridSearcher(
                 config=self.config.retrieval,
                 embeddings=vector_index,
-                debug_dump=RetrievalDebugDump(
-                    enabled=self.config.retrieval.debug_dump,
-                    cache_dir=self.config.runtime.cache_dir,
-                ),
+                debug_dump=retrieval_dump,
                 trace_sink=trace_sink,
             ),
             reranker=reranker,
@@ -126,6 +134,7 @@ class Application:
             gate=gate,
             lease=lease,
             trace_sink=trace_sink,
+            debug_dump=retrieval_dump,
             vector_index=vector_index,
         )
         answering = AnsweringPhase(
@@ -140,6 +149,7 @@ class Application:
             gate=gate,
             lease=lease,
             trace_sink=trace_sink,
+            answer_dump=AnswerDebugDump(enabled=debug_on, cache_dir=cache_dir),
         )
         return DocumentAnalysisService(
             document_source=FileDocumentSource(self.config.input.documents_dir),

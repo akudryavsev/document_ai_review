@@ -1,7 +1,9 @@
 # Рабочий пример прогона. Документы и вопросы лежат в ./experiments/ (каталог в .gitignore).
-# Имена в embedding.models, reranker.models и answer.models — файлы в models/, с суффиксом .gguf.
+# Запись списка — объект name и params. name — файл в models/, с суффиксом .gguf.
+# У эмбеддера в params обязателен pooling: mean, cls или last.
+# У реранкера в params обязателен pooling: rank.
 # Команда run до любой фазы проверяет, что каждый файл из трёх списков есть в models/.
-# Для этого примера нужны models/embed.gguf, models/rerank.gguf и models/answer.gguf.
+# Для этого примера нужны models/FRIDA-bf16.gguf, models/lb-reranker-0.5B-v1.0-f16.gguf и models/gemma-4-12b-it-qat-q4_0.gguf.
 # Фаза A1 считает эмбеддинги кусков файлом из embedding.models, поэтому без него она не стартует.
 #
 # Список фаз задаёт --phase. Без флага выполняются A1,A2,B.
@@ -21,19 +23,25 @@ extraction:
   debug_dump: true
 
 chunking:
-  max_tokens: 800
-  overlap_tokens: 100
-  min_chunk_tokens: 100
+  max_tokens: 750
+  overlap_tokens: 80
+  min_chunk_tokens: 80
   preserve_section_path: true
 
 inference:
   base_url: "http://inference:8080"
-  request_timeout_sec: 120
+  request_timeout_sec: 600
   poll_interval_sec: 0.5
 
 embedding:
   models:
-    - embed.gguf
+    - name: GigaEmbeddings-10B-IQ4_XS-Q5_K-hybrid.gguf
+      params:
+        pooling: mean
+        ctx-size: 4096
+        parallel: 1
+        n-gpu-layers: 99
+        ubatch-size: 4096
   batch_size: 8
   dtype: "fp16"
   device: "cuda:0"
@@ -54,7 +62,13 @@ retrieval:
 reranker:
   enabled: true
   models:
-    - rerank.gguf
+    - name: lb-reranker-0.5B-v1.0-f16.gguf
+      params:
+        pooling: rank
+        batch-size: 4096
+        ubatch-size: 4096
+  # category — скорит только канонический вопрос. synonyms_rerank — ещё и синонимы.
+  query_strategy: category
   top_n: 5
   # 0 — в сборку всегда top_n лучших. Поднять для отсечения слабых скоров.
   score_threshold: 0
@@ -77,7 +91,9 @@ context:
 
 answer:
   models:
-    - answer.gguf
+    - name: gemma-4-12b-it-qat-q4_0.gguf
+      params:
+        ctx-size: 16384
   device: "auto"
   temperature: 0
   max_output_tokens: 800
@@ -97,7 +113,8 @@ runtime:
   retry_pause_sec: 0
   question_parallelism: 1
   results_dir: "./experiments/results"
-  log_level: "INFO"
+  # WARNING — отказ документа. INFO добавляет границы стадий.
+  log_level: "DEBUG"
   # Корень чанков, эмбеддингов вопросов, embed_cache, meta ответов и debug.
   # Куски документа: experiments/emb/<файл эмбеддера>/<имя документа>/
   cache_dir: "./experiments"

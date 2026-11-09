@@ -30,6 +30,7 @@ class RetrievalPhase(Phase):
     """Retrieval + rerank + ContextAssembler.
 
     Attributes:
+        trace_stage: Имя фазы в событии отказа документа.
         retriever: HybridRetriever.
         reranker: RerankerGateway.
         assembler: ContextAssembler.
@@ -40,6 +41,8 @@ class RetrievalPhase(Phase):
         debug_dump: Опциональный дамп реранка.
         vector_index: Индекс байтов хранилища или None у подделки поиска.
     """
+
+    trace_stage = "A2"
 
     def __init__(
         self,
@@ -150,13 +153,7 @@ class RetrievalPhase(Phase):
             chunks = self.store.load_chunks(doc_id)
             if chunks is None:
                 failed += 1
-                outcomes.append(
-                    DocumentPhaseOutcome(
-                        doc_id=doc_id,
-                        status="failed",
-                        reason="missing_chunks",
-                    )
-                )
+                outcomes.append(self.fail_document(doc_id, "missing_chunks"))
                 continue
             try:
                 if self.vector_index is not None:
@@ -211,13 +208,7 @@ class RetrievalPhase(Phase):
                 )
             except Exception as error:  # noqa: BLE001 — устойчивость прогона
                 failed += 1
-                outcomes.append(
-                    DocumentPhaseOutcome(
-                        doc_id=doc_id,
-                        status="failed",
-                        reason=str(error),
-                    )
-                )
+                outcomes.append(self.fail_document(doc_id, str(error)))
         return PhaseReport(
             phase="A2",
             computed=computed,
@@ -313,7 +304,7 @@ class RetrievalPhase(Phase):
         question: Question,
         context: PhaseContext,
     ) -> CandidateBatch:
-        """Скорирует пары вариант × кандидат и отбирает top_n.
+        """Скорирует пары запрос × кандидат по query_strategy и отбирает top_n.
 
         Args:
             batch: Кандидаты до реранка.
@@ -323,7 +314,7 @@ class RetrievalPhase(Phase):
         Returns:
             CandidateBatch с rerank_score.
         """
-        variants = self._variant_texts(question)
+        variants = self._rerank_queries(question, context)
         pairs: list[RerankPair] = []
         for candidate in batch.candidates:
             for variant_index, variant_text in enumerate(variants):
@@ -445,6 +436,28 @@ class RetrievalPhase(Phase):
             chunking_hash=batch.chunking_hash,
         )
 
+    def _rerank_queries(self, question: Question, context: PhaseContext) -> list[str]:
+        """Тексты запросов реранка по query_strategy.
+
+        Args:
+            question: Вопрос.
+            context: Конфиг фазы.
+
+        Returns:
+            Список строк: только category либо category и синонимы.
+
+        Raises:
+            ValueError: Стратегия не из допустимого набора.
+        """
+        strategy = context.config.reranker.query_strategy
+        if strategy == "category":
+            return [question.category]
+        if strategy == "synonyms_rerank":
+            return self._variant_texts(question)
+        raise ValueError(
+            f"Неподдерживаемая reranker.query_strategy: {strategy}"
+        )
+
     def _variant_texts(self, question: Question) -> list[str]:
         """Тексты вариантов в порядке category, synonyms.
 
@@ -459,13 +472,14 @@ class RetrievalPhase(Phase):
         return texts
 
     def _write_context_dump(self, context: PhaseContext, bundle: ContextBundle) -> None:
-        """Пишет Markdown бандла, если retrieval.debug_dump включён.
+        """Пишет Markdown бандла, если включён флаг или уровень DEBUG.
 
         Args:
             context: Контекст фазы с каталогом cache.
             bundle: Бандл после записи боевого JSON.
         """
-        if not context.config.retrieval.debug_dump:
+        debug_level = context.config.runtime.log_level == "DEBUG"
+        if not context.config.retrieval.debug_dump and not debug_level:
             return
         ContextDebugDump(
             enabled=True,

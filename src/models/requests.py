@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from models.config import AppConfig
+from models.model_list import ModelListError
 
 
 PhaseName = Literal["A1", "A2", "B"]
@@ -54,20 +55,20 @@ class RunRequest(BaseModel):
     def resolved_config(self) -> AppConfig:
         """Применяет overrides к копии конфига.
 
+        Флаг модели оставляет имя, которое уже есть в списке. Записи
+        params при этом не выкидываются: ini строится по полному конфигу.
+
         Returns:
             AppConfig с учётом переопределений.
+
+        Raises:
+            ModelListError: Имени из флага нет в списке конфига.
         """
         config = self.config.model_copy(deep=True)
         overrides = self.overrides
-        if overrides.answer_model is not None:
-            config.answer.model = overrides.answer_model
-            config.answer.models = [overrides.answer_model]
-        if overrides.reranker_model is not None:
-            config.reranker.model = overrides.reranker_model
-            config.reranker.models = [overrides.reranker_model]
-        if overrides.embedding_model is not None:
-            config.embedding.model = overrides.embedding_model
-            config.embedding.models = [overrides.embedding_model]
+        self._keep_named(config.answer, overrides.answer_model)
+        self._keep_named(config.reranker, overrides.reranker_model)
+        self._keep_named(config.embedding, overrides.embedding_model)
         if overrides.cache_dir is not None:
             config.runtime.cache_dir = overrides.cache_dir
         if overrides.contexts_dir is not None:
@@ -77,6 +78,24 @@ class RunRequest(BaseModel):
         if overrides.index_dir is not None:
             config.phases.index_dir = overrides.index_dir
         return config
+
+    def _keep_named(self, role: object, selected: str | None) -> None:
+        """Оставляет в роли одну запись из уже заданного списка.
+
+        Args:
+            role: Секция embedding, reranker или answer.
+            selected: Имя файла из флага CLI или None.
+
+        Raises:
+            ModelListError: Имени нет в списке конфига.
+        """
+        if selected is None:
+            return
+        names = list(getattr(role, "models") or [])
+        if selected not in names:
+            raise ModelListError(f"имя {selected} нет в списке конфига")
+        role.model = selected
+        role.models = [selected]
 
 
 class EvalRequest(BaseModel):

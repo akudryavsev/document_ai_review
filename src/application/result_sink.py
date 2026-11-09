@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from application.user_report import UserAnswerReport
 from models.artifacts import AnswerRecord
 from models.summary import RunSummary
 from ports.pipeline import ResultSink
@@ -29,7 +30,7 @@ class FileResultSink(ResultSink):
         self.answers: list[AnswerRecord] = []
 
     def write_answer(self, record: AnswerRecord) -> None:
-        """Заменяет строку того же документа, вопроса и тройки.
+        """Заменяет строку того же документа, вопроса и тройки и пересобирает md.
 
         Args:
             record: AnswerRecord.
@@ -41,30 +42,32 @@ class FileResultSink(ResultSink):
         ]
         self.answers.append(record)
         path = self.results_dir / f"{record.doc_id}.jsonl"
-        kept = self._kept_lines(path, record)
-        kept.append(record.model_dump_json())
-        path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        kept = self._kept_records(path, record)
+        kept.append(record)
+        lines = [item.model_dump_json() for item in kept]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        UserAnswerReport().write(kept, self.results_dir / f"{record.doc_id}.md")
 
-    def _kept_lines(self, path: Path, record: AnswerRecord) -> list[str]:
-        """Оставляет строки файла, кроме той же тройки и вопроса.
+    def _kept_records(self, path: Path, record: AnswerRecord) -> list[AnswerRecord]:
+        """Оставляет записи файла, кроме той же тройки и вопроса.
 
         Args:
             path: Файл jsonl документа.
             record: Новая запись.
 
         Returns:
-            Строки, которые остаются в файле.
+            Записи, которые остаются в файле, в прежнем порядке.
         """
         if not path.is_file():
             return []
-        kept: list[str] = []
+        kept: list[AnswerRecord] = []
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             existing = AnswerRecord.model_validate_json(line)
             if self._same_triple(existing, record):
                 continue
-            kept.append(line)
+            kept.append(existing)
         return kept
 
     def _same_triple(self, left: AnswerRecord, right: AnswerRecord) -> bool:

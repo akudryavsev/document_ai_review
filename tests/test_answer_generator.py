@@ -88,7 +88,7 @@ class PauseLog:
 
 
 class TestAnswerGenerator:
-    """Каталог T-GEN-01…11."""
+    """Каталог T-GEN-01…13."""
 
     def test_t_gen_01_empty_search_skips_llm(self) -> None:
         """Пустой поиск не вызывает infer и пишет системную фразу."""
@@ -122,7 +122,7 @@ class TestAnswerGenerator:
         assert record.model == "Qwen/Qwen3-8B"
 
     def test_t_gen_02_prompt_contains_required_parts(self) -> None:
-        """Промпт содержит вопрос, схему, причины и заголовок фрагмента."""
+        """Промпт содержит вопрос, схему, причины, фрагмент и пример JSON в конце."""
         category = "Срок хранения персональных данных"
         synonym = "период хранения ПДн"
         fragment = self._fragment(
@@ -163,6 +163,7 @@ class TestAnswerGenerator:
         assert "разд. 3.2.1. Сроки" in prompt
         assert "ссылкой [n]" in prompt
         assert synonym in prompt
+        self._assert_example_closes_prompt(prompt, "Данные хранятся пять лет.")
         assert llm.calls[0].temperature == 0
         assert llm.calls[0].max_output_tokens is None
         assert llm.calls[0].doc_id == bundle.doc_id
@@ -206,7 +207,7 @@ class TestAnswerGenerator:
         assert "Искали по: Срок хранения" in prompt
 
     def test_t_gen_04_citations_not_required(self) -> None:
-        """require_citations=false не добавляет требование ссылки [n]."""
+        """require_citations=false не добавляет требование ссылки [n], пример остаётся."""
         bundle = self._bundle(
             category="Срок хранения",
             synonyms=[],
@@ -228,6 +229,7 @@ class TestAnswerGenerator:
         assert "ссылкой [n]" not in prompt
         assert "по фрагментам" in prompt
         assert "[1]" in prompt
+        self._assert_example_closes_prompt(prompt, "стр. 1, разд. Раздел")
 
     def test_t_gen_05_valid_json_becomes_record(self) -> None:
         """Валидный JSON с цитатой собирает запись без prepared_context."""
@@ -307,20 +309,20 @@ class TestAnswerGenerator:
         assert record.explanation == "Найденные фрагменты — в prepared_context."
         assert record.found is False
         assert record.citations == []
-        assert record.prepared_context == llm.calls[0].prompt
-        assert "текст фрагмента" in (record.prepared_context or "")
+        assert record.prepared_context is None
+        assert generator.exchange.prompt == llm.calls[0].prompt
+        assert "текст фрагмента" in (generator.exchange.prompt or "")
         assert record.tokens.prompt == 0
         assert record.tokens.completion == 0
         assert record.latency_ms == 0
         assert record.confidence is None
 
     def test_t_gen_07_retry_after_non_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Первый ответ не JSON, второй валиден; между ними одна пауза."""
+        """Первый ответ не JSON и не ограда, второй валиден; между ними одна пауза."""
         pauses = PauseLog()
         monkeypatch.setattr("answer.generator.time.sleep", pauses.sleep)
         bundle = self._nonempty("Срок хранения")
         question = self._question("Срок хранения", [])
-        fenced = "```json\n" + self._valid_json(answer="первый") + "\n```"
         second = self._response(
             self._valid_json(answer="второй ответ", explanation="пояснение два"),
             prompt_tokens=3,
@@ -329,7 +331,7 @@ class TestAnswerGenerator:
         )
         llm = self._llm(
             [
-                self._response(fenced, prompt_tokens=1, latency_ms=1.0),
+                self._response("не json", prompt_tokens=1, latency_ms=1.0),
                 second,
             ]
         )
@@ -342,6 +344,67 @@ class TestAnswerGenerator:
         assert record.status == "ok"
         assert record.tokens.prompt == 3
         assert record.latency_ms == 9.0
+
+    def test_t_gen_12_fenced_json_is_accepted(self) -> None:
+        """Одна ограда вокруг годного JSON не требует повтора."""
+        bundle = self._nonempty("Срок хранения")
+        question = self._question("Срок хранения", [])
+        body = self._valid_json(
+            found=False,
+            answer="В фрагментах этого нет.",
+            explanation="Фрагмент не содержит нужных сведений.",
+            reason="not_present",
+        )
+        fences = (
+            f"\n```json\n{body}\n```\n",
+            f"```\n{body}\n```",
+            f"```JSON \n{body}\n``` ",
+        )
+        for fenced in fences:
+            llm = self._llm(
+                [
+                    self._response(fenced, prompt_tokens=4, latency_ms=8.0),
+                    self._response(self._valid_json(answer="второй")),
+                ]
+            )
+            generator = self._generator(llm, retries=2)
+            record = generator.generate(bundle, question)
+            assert len(llm.calls) == 1
+            assert record.found is False
+            assert record.reason == "not_present"
+            assert record.answer == "В фрагментах этого нет."
+            assert record.explanation == "Фрагмент не содержит нужных сведений."
+            assert record.citations == []
+            assert record.status == "ok"
+            assert record.tokens.prompt == 4
+            assert record.latency_ms == 8.0
+
+    def test_t_gen_13_fence_does_not_hide_other_text(self) -> None:
+        """Чужой текст, другая метка, вторая ограда и битый JSON идут в повтор."""
+        bundle = self._nonempty("Срок хранения")
+        question = self._question("Срок хранения", [])
+        body = self._valid_json(answer="внутри")
+        second = self._valid_json(answer="после повтора", explanation="уже без ограды")
+        broken_cases = (
+            f"Ответ:\n```json\n{body}\n```",
+            f"```json\n{body}\n```\nготово",
+            "```json\n{не json}\n```",
+            f"```python\n{body}\n```",
+            f"```json\n```json\n{body}\n```\n```",
+        )
+        for broken in broken_cases:
+            llm = self._llm(
+                [
+                    self._response(broken),
+                    self._response(second),
+                ]
+            )
+            generator = self._generator(llm, retries=2)
+            record = generator.generate(bundle, question)
+            assert len(llm.calls) == 2
+            assert record.answer == "после повтора"
+            assert record.explanation == "уже без ограды"
+            assert record.status == "ok"
 
     def test_t_gen_08_invalid_reason_then_valid(self) -> None:
         """found=true вместе с reason не из null — неудачная попытка."""
@@ -475,6 +538,30 @@ class TestAnswerGenerator:
                     )
                 ],
             )
+
+    def _assert_example_closes_prompt(self, prompt: str, fragment_text: str) -> None:
+        """Проверяет, что фиксированный пример стоит после фрагмента и закрывает промпт.
+
+        Args:
+            prompt: Текст, ушедший в шлюз.
+            fragment_text: Уникальная подстрока фрагмента этого вызова.
+        """
+        example = json.dumps(
+            {
+                "found": True,
+                "answer": "текст ответа на вопрос",
+                "explanation": "пояснение и обоснование отдельно от ответа",
+                "reason": None,
+                "citations": [{"n": 1, "quote": "цитата из фрагмента"}],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        marker = "Пример ответа:"
+        assert prompt.index(fragment_text) < prompt.index(marker)
+        assert "```" not in prompt
+        assert "Вопрос:" not in example
+        assert prompt.endswith(f"{marker}\n{example}\n")
 
     def _generator(
         self,

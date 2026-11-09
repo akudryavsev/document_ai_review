@@ -265,22 +265,13 @@ class Chunker(ChunkerPort):
         spans = self._counter.spans(text)
         if len(spans) <= self.config.max_tokens:
             return [(0, len(text))]
-        block_starts = self._block_token_starts(spans, ranges)
+        edges = self._block_edges(spans, ranges)
         sentence_starts = self._sentence_token_starts(text, spans)
         windows: list[tuple[int, int]] = []
         start_token = 0
         total = len(spans)
         while start_token < total:
-            hard_end = min(start_token + self.config.max_tokens, total)
-            if hard_end >= total:
-                end_token = total
-            else:
-                end_token = self._snap_end(
-                    start_token,
-                    hard_end,
-                    block_starts,
-                    sentence_starts,
-                )
+            end_token = self._window_end(start_token, total, edges, sentence_starts)
             if end_token <= start_token:
                 end_token = start_token + 1
             if start_token == 0:
@@ -295,40 +286,135 @@ class Chunker(ChunkerPort):
             if end_token >= total:
                 break
             next_start = end_token - self.config.overlap_tokens
+            # Чанк короче перекрытия нельзя сдвинуть на overlap: начало осталось бы на месте.
+            if next_start <= start_token:
+                next_start = end_token
             if next_start <= start_token:
                 next_start = start_token + 1
             start_token = next_start
         return self._merge_short_tail(text, windows)
 
-    def _snap_end(
+    def _window_end(
         self,
         start_token: int,
-        hard_end: int,
-        block_starts: set[int],
+        total: int,
+        edges: list[int],
         sentence_starts: set[int],
     ) -> int:
-        """Сдвигает конец окна к границе блока, иначе предложения, иначе слова.
+        """Набирает конец окна: целые куски, пока они влезают, длинный блок — изнутри.
 
         Args:
             start_token: Индекс первого токена окна.
-            hard_end: Правая граница по max_tokens, не включая этот токен.
-            block_starts: Индексы первых токенов блоков, кроме первого.
+            total: Число токенов раздела.
+            edges: Границы блоков, включая 0 и total.
             sentence_starts: Индексы токенов, с которых начинается предложение.
 
         Returns:
-            Индекс конца окна.
+            Индекс конца окна, не включая этот токен.
         """
-        token_index = hard_end
-        while token_index > start_token:
-            if token_index in block_starts:
-                return token_index
-            token_index -= 1
-        token_index = hard_end
-        while token_index > start_token:
-            if token_index in sentence_starts:
-                return token_index
-            token_index -= 1
-        return hard_end
+        if total - start_token <= self.config.max_tokens:
+            return total
+        limit = start_token + self.config.max_tokens
+        cursor = start_token
+        edge_index = self._edge_index(edges, start_token)
+        while cursor < limit and edge_index + 1 < len(edges):
+            piece_end = edges[edge_index + 1]
+            if piece_end <= limit:
+                cursor = piece_end
+                edge_index += 1
+                continue
+            remainder = piece_end - cursor
+            if remainder > self.config.max_tokens:
+                return self._pack_sentences(
+                    cursor,
+                    limit,
+                    sentence_starts,
+                    piece_end,
+                )
+            return cursor
+        return cursor
+
+    def _edge_index(self, edges: list[int], start_token: int) -> int:
+        """Находит блок, внутри которого лежит начало окна.
+
+        Args:
+            edges: Границы блоков.
+            start_token: Индекс первого токена окна.
+
+        Returns:
+            Индекс левой границы этого блока в edges.
+        """
+        found = 0
+        for index, edge in enumerate(edges):
+            if edge <= start_token:
+                found = index
+                continue
+            break
+        return found
+
+    def _pack_sentences(
+        self,
+        cursor: int,
+        limit: int,
+        sentence_starts: set[int],
+        piece_end: int,
+    ) -> int:
+        """Добирает предложения длинного блока до лимита окна.
+
+        Args:
+            cursor: Первый токен ещё не взятого хвоста блока.
+            limit: Правая граница окна по max_tokens, не включая этот токен.
+            sentence_starts: Индексы начал предложений.
+            piece_end: Конец блока, не включая этот токен.
+
+        Returns:
+            Индекс конца окна. Предложение длиннее лимита режется по словам.
+        """
+        boundaries: list[int] = []
+        for token_index in sorted(sentence_starts):
+            if token_index <= cursor:
+                continue
+            if token_index > piece_end:
+                break
+            boundaries.append(token_index)
+        if not boundaries or boundaries[-1] != piece_end:
+            boundaries.append(piece_end)
+        position = cursor
+        for boundary in boundaries:
+            if boundary <= position:
+                continue
+            if boundary <= limit:
+                position = boundary
+                continue
+            sentence_length = boundary - position
+            if sentence_length > self.config.max_tokens:
+                return limit
+            return position
+        return position
+
+    def _block_edges(
+        self,
+        spans: list[tuple[int, int]],
+        ranges: list[tuple[int, int, ExtractedBlock]],
+    ) -> list[int]:
+        """Собирает границы блоков в индексах токенов.
+
+        Args:
+            spans: Границы токенов.
+            ranges: Диапазоны блоков.
+
+        Returns:
+            Индексы начал блоков, плюс 0 и число токенов в конце.
+        """
+        edges = [0]
+        for token_index in sorted(self._block_token_starts(spans, ranges)):
+            if token_index <= 0 or token_index >= len(spans):
+                continue
+            if edges[-1] == token_index:
+                continue
+            edges.append(token_index)
+        edges.append(len(spans))
+        return edges
 
     def _block_token_starts(
         self,

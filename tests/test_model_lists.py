@@ -1,32 +1,48 @@
-"""T-MDL: списки моделей, ini и группировка eval."""
+"""T-MDL: записи моделей, params и models.ini."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
-from application import Application
-from application.result_sink import FileResultSink
-from gateways.models_ini import LlamaModelsIni, ModelCatalog, ModelListError
-from models.artifacts import AnswerRecord
+from entry import CliApp
+from gateways.models_ini import LlamaModelsIni
 from models.config import AppConfig
-from models.requests import EvalRequest, RunOverrides
-from models.summary import EvalReport
-from runs.evaluation import EvaluationError, EvaluationRun
+from models.model_list import ModelListError
+from models.requests import RunRequest
 from tests.helpers import ServiceFactory
 from tests.support import build_harness
-from entry.cli import CliApp
 
+_SECTION_TWO = """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: cls
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+    - name: qwen-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+    - name: Llama-3.1-8B-Q4_K_M.gguf
+      params:
+        ctx-size: 8192
+"""
 
-_CANONICAL_INI = """[*]
+_SECTION_FOUR = """[*]
 ctx-size = 4096
 
 [bge-m3-q8.gguf]
 model = /models/bge-m3-q8.gguf
 embedding = true
+pooling = cls
 
 [bge-reranker.gguf]
 model = /models/bge-reranker.gguf
@@ -45,464 +61,446 @@ model = /models/Qwen3-8B-Q4_K_M.gguf
 
 [Llama-3.1-8B-Q4_K_M.gguf]
 model = /models/Llama-3.1-8B-Q4_K_M.gguf
+ctx-size = 8192
 """
 
 
 class TestModelLists:
-    """Каталог T-MDL-01…14."""
+    """Каталог T-MDL-02…07 и T-MDL-11, T-MDL-15…19."""
 
-    def test_t_mdl_01_two_answer_models_one_indexing(self) -> None:
-        """Две модели ответа дают одну A1, одну A2 и две строки на вопрос."""
-        harness = build_harness()
-        self._set_lists(harness.config, answers=["a.gguf", "b.gguf"])
-        service = ServiceFactory().build(harness)
-        summary = service.run(harness.run_request())
-        assert len(harness.extractor.calls) == len(harness.documents)
-        assert harness.embedding.load_calls == 1
-        assert harness.reranker.load_calls == 1
-        assert harness.llm.load_calls == 2
-        assert summary.phases["A1"].computed == len(harness.documents)
-        assert summary.phases["B"].computed == len(harness.documents) * 2
-        q001 = [
-            answer
-            for answer in harness.result_sink.answers
-            if answer.doc_id == "doc_a.docx" and answer.question_id == "Q001"
-        ]
-        assert {answer.answer_model for answer in q001} == {"a.gguf", "b.gguf"}
-
-    def test_t_mdl_02_empty_list_and_both_keys_fail_before_phases(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Пустой список и оба ключа сразу — ошибка до фаз."""
-        monkeypatch.chdir(tmp_path)
-        self._forbid_build(monkeypatch)
-        empty_path = tmp_path / "empty.yaml"
-        empty_path.write_text("embedding:\n  models: []\n", encoding="utf-8")
-        both_path = tmp_path / "both.yaml"
-        both_path.write_text(
-            "embedding:\n  model: a.gguf\n  models:\n    - a.gguf\n",
-            encoding="utf-8",
-        )
-        assert CliApp().main(["run", "--config", str(empty_path)]) == 1
-        assert CliApp().main(["run", "--config", str(both_path)]) == 1
-        with pytest.raises(ValidationError, match="список моделей пуст"):
-            AppConfig.model_validate({"embedding": {"models": []}})
-        with pytest.raises(ValidationError, match="одновременно заданы model и models"):
-            AppConfig.model_validate(
-                {"embedding": {"model": "a.gguf", "models": ["a.gguf"]}}
-            )
-
-    def test_t_mdl_03_missing_file_does_not_rewrite_ini(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Нет файла модели — ошибка до фаз, ini остаётся прежним."""
-        monkeypatch.chdir(tmp_path)
-        self._forbid_build(monkeypatch)
-        config_path = self._write_yaml(
+    def test_t_mdl_02_empty_list_or_both_keys(self, tmp_path: Path) -> None:
+        """Пустой models или оба ключа model и models — ошибка до фаз."""
+        empty = self._config_path(tmp_path, "embedding:\n  models: []\n")
+        both = self._config_path(
             tmp_path,
-            ["missing.gguf"],
-            ["rerank.gguf"],
-            ["answer.gguf"],
+            "embedding:\n  model:\n    name: a.gguf\n  models:\n    - name: b.gguf\n",
         )
-        (tmp_path / "models").mkdir()
-        (tmp_path / "models" / "rerank.gguf").write_bytes(b"r")
-        (tmp_path / "models" / "answer.gguf").write_bytes(b"a")
-        ini_path = tmp_path / "deploy" / "llama" / "models.ini"
-        ini_path.parent.mkdir(parents=True)
-        ini_path.write_text("старый\n", encoding="utf-8")
-        code = CliApp().main(["write-models-ini", "--config", str(config_path)])
+        assert self._command(tmp_path, "write-models-ini", empty) == 1
+        assert self._command(tmp_path, "write-models-ini", both) == 1
+
+    def test_t_mdl_03_missing_file_does_not_write_ini(self, tmp_path: Path) -> None:
+        """Нет файла GGUF — ошибка до фаз, ini не меняется."""
+        config_path = self._config_path(tmp_path, _SECTION_TWO)
+        models = tmp_path / "models"
+        self._touch(models, "bge-m3-q8.gguf", "bge-reranker.gguf", "qwen-reranker.gguf")
+        ini_path = self._sentinel(tmp_path)
+        code = self._command(tmp_path, "write-models-ini", config_path, models, ini_path)
         assert code == 1
-        assert ini_path.read_text(encoding="utf-8") == "старый\n"
+        assert ini_path.read_text(encoding="utf-8") == "sentinel"
 
-    def test_t_mdl_04_duplicate_names_fail(self, tmp_path: Path) -> None:
-        """Повтор в одном списке или одно имя в двух ролях — ошибка."""
-        models_dir = tmp_path / "models"
-        models_dir.mkdir()
-        (models_dir / "same.gguf").write_bytes(b"s")
-        repeated = self._config(["same.gguf", "same.gguf"], ["rerank.gguf"], ["a.gguf"])
-        shared = self._config(["same.gguf"], ["same.gguf"], ["a.gguf"])
-        with pytest.raises(ModelListError):
-            ModelCatalog(models_dir).check(repeated)
-        with pytest.raises(ModelListError):
-            ModelCatalog(models_dir).check(shared)
+    def test_t_mdl_04_duplicate_names(self, tmp_path: Path) -> None:
+        """Повтор в одном списке или одно имя в двух ролях — ошибка до фаз."""
+        repeated = """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: cls
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+"""
+        shared = """
+embedding:
+  models:
+    - name: same.gguf
+      params:
+        pooling: cls
+reranker:
+  models:
+    - name: same.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+"""
+        ini_path = self._sentinel(tmp_path)
+        assert self._command(tmp_path, "write-models-ini", self._config_path(tmp_path, repeated), ini_path=ini_path) == 1
+        assert self._command(tmp_path, "write-models-ini", self._config_path(tmp_path, shared), ini_path=ini_path) == 1
+        assert ini_path.read_text(encoding="utf-8") == "sentinel"
 
-    def test_t_mdl_05_single_model_key_becomes_list(self) -> None:
-        """Ключ model без models даёт список из одного имени."""
-        config = AppConfig.model_validate({"embedding": {"model": "file.gguf"}})
-        assert config.embedding.model == "file.gguf"
-        assert config.embedding.models == ["file.gguf"]
+    def test_t_mdl_05_single_model_object_keeps_params(self, tmp_path: Path) -> None:
+        """Ключ model — одна запись, список имён и её params заполнены."""
+        text = """
+embedding:
+  model:
+    name: bge-m3-q8.gguf
+    params:
+      pooling: cls
+"""
+        config = AppConfig.from_yaml(self._config_path(tmp_path, text))
+        assert config.embedding.models == ["bge-m3-q8.gguf"]
+        assert config.embedding.model == "bge-m3-q8.gguf"
+        assert config.embedding.entries[0].params["pooling"] == "cls"
 
-    def test_t_mdl_06_write_models_ini_matches_spec(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """write-models-ini пишет канонический текст списков."""
-        monkeypatch.chdir(tmp_path)
-        names = [
+    def test_t_mdl_06_write_models_ini_matches_section_four(self, tmp_path: Path) -> None:
+        """write-models-ini на списках раздела 2 пишет текст раздела 4."""
+        config_path = self._config_path(tmp_path, _SECTION_TWO)
+        models = tmp_path / "models"
+        self._touch(
+            models,
             "bge-m3-q8.gguf",
             "bge-reranker.gguf",
             "qwen-reranker.gguf",
             "Qwen3-8B-Q4_K_M.gguf",
             "Llama-3.1-8B-Q4_K_M.gguf",
-        ]
-        for name in names:
-            path = tmp_path / "models" / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"w")
-        config_path = self._write_yaml(
-            tmp_path,
-            ["bge-m3-q8.gguf"],
-            ["bge-reranker.gguf", "qwen-reranker.gguf"],
-            ["Qwen3-8B-Q4_K_M.gguf", "Llama-3.1-8B-Q4_K_M.gguf"],
         )
-        code = CliApp().main(["write-models-ini", "--config", str(config_path)])
-        assert code == 0
-        written = (tmp_path / "deploy" / "llama" / "models.ini").read_text(
-            encoding="utf-8"
-        )
-        assert written == _CANONICAL_INI
+        ini_path = tmp_path / "models.ini"
+        assert self._command(tmp_path, "write-models-ini", config_path, models, ini_path) == 0
+        assert ini_path.read_text(encoding="utf-8") == _SECTION_FOUR
+        scalars = """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+        flash-attn: true
+        rope-scale: 1.5
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+"""
+        rendered = LlamaModelsIni().render(AppConfig.from_yaml(self._config_path(tmp_path, scalars)))
+        assert "flash-attn = true" in rendered
+        assert "rope-scale = 1.5" in rendered
+        repo_root = Path(__file__).resolve().parents[1]
+        repo_ini = LlamaModelsIni().render(AppConfig.from_yaml(repo_root / "config.yaml"))
+        assert (repo_root / "deploy/llama/models.ini").read_text(encoding="utf-8") == repo_ini
 
-    def test_t_mdl_07_run_stops_when_ini_differs(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """run при чужом ini завершается до фаз."""
-        monkeypatch.chdir(tmp_path)
-        self._forbid_build(monkeypatch)
-        config_path = self._write_yaml(
-            tmp_path,
-            ["embed.gguf"],
-            ["rerank.gguf"],
-            ["answer.gguf"],
+    def test_t_mdl_07_run_writes_ini_and_stops(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """run при другом ini пишет канонический текст и останавливается до фаз."""
+        config_path = self._config_path(tmp_path, _SECTION_TWO)
+        models = tmp_path / "models"
+        self._touch(
+            models,
+            "bge-m3-q8.gguf",
+            "bge-reranker.gguf",
+            "qwen-reranker.gguf",
+            "Qwen3-8B-Q4_K_M.gguf",
+            "Llama-3.1-8B-Q4_K_M.gguf",
         )
-        for name in ("embed.gguf", "rerank.gguf", "answer.gguf"):
-            path = tmp_path / "models" / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"w")
-        ini_path = tmp_path / "deploy" / "llama" / "models.ini"
-        ini_path.parent.mkdir(parents=True)
-        ini_path.write_text("другой\n", encoding="utf-8")
-        code = CliApp().main(["run", "--config", str(config_path), "--phase", "A1"])
+        ini_path = tmp_path / "models.ini"
+        ini_path.write_text("другой пресет\n", encoding="utf-8")
+        code = self._command(tmp_path, "run", config_path, models, ini_path)
+        captured = capsys.readouterr()
         assert code == 1
-        assert "write-models-ini" in capsys.readouterr().err
+        assert ini_path.read_text(encoding="utf-8") == _SECTION_FOUR
+        assert "models.ini обновлён" in captured.err
+        assert "docker compose --profile poc up -d --force-recreate inference" in captured.err
+        assert "run complete" not in captured.out
+        LlamaModelsIni().prepare_for_run(AppConfig.from_yaml(config_path), ini_path)
 
-    def test_t_mdl_08_second_answer_is_computed(self) -> None:
-        """Уже посчитанная модель ответа не отменяет B следующей."""
+    def test_t_mdl_11_flag_keeps_full_ini(self, tmp_path: Path) -> None:
+        """Флаг оставляет одну модель ответа, канонический ini остаётся полным."""
+        config = AppConfig.from_yaml(self._config_path(tmp_path, _SECTION_TWO))
+        ini_path = tmp_path / "models.ini"
+        LlamaModelsIni().write(config, ini_path)
+        before = ini_path.read_text(encoding="utf-8")
+        request = RunRequest(config=config)
+        request.overrides.answer_model = "Llama-3.1-8B-Q4_K_M.gguf"
+        resolved = request.resolved_config()
+        assert resolved.answer.models == ["Llama-3.1-8B-Q4_K_M.gguf"]
+        assert "Qwen3-8B-Q4_K_M.gguf" in LlamaModelsIni().render(config)
         harness = build_harness()
-        self._set_lists(harness.config, answers=["a.gguf"])
-        service = ServiceFactory().build(harness)
-        service.run(harness.run_request())
-        loads_after_first = harness.llm.load_calls
-        harness.config.answer.models = ["a.gguf", "b.gguf"]
-        summary = service.run(harness.run_request())
-        assert harness.llm.load_calls == loads_after_first + 1
-        assert summary.phases["B"].computed == len(harness.documents)
-        assert summary.phases["B"].skipped == len(harness.documents)
-        meta_keys = [
-            key
-            for key in harness.store.blobs
-            if key.startswith("cache/answers/") and key.endswith("/meta.json")
-        ]
-        assert any("/a.gguf/" in key for key in meta_keys)
-        assert any("/b.gguf/" in key for key in meta_keys)
+        harness.config = config
+        run_request = harness.run_request(phases=["A1"])
+        run_request.overrides.answer_model = "Llama-3.1-8B-Q4_K_M.gguf"
+        summary = ServiceFactory().build(harness).run(run_request)
+        answer_names = {item.answer_model for item in summary.combinations}
+        assert answer_names == {"Llama-3.1-8B-Q4_K_M.gguf"}
+        assert ini_path.read_text(encoding="utf-8") == before
 
-    def test_t_mdl_09_same_triple_replaces_jsonl_line(self, tmp_path: Path) -> None:
-        """Повтор той же тройки оставляет одну новую строку."""
-        sink = FileResultSink(tmp_path)
-        first = self._record("старый")
-        second = self._record("новый")
-        other = self._record("другая")
-        other.answer_model = "other.gguf"
-        other.model = "other.gguf"
-        sink.write_answer(first)
-        sink.write_answer(other)
-        sink.write_answer(second)
-        lines = (tmp_path / "doc_a.docx.jsonl").read_text(encoding="utf-8").splitlines()
-        assert len(lines) == 2
-        kept_other = AnswerRecord.model_validate_json(lines[0])
-        kept_new = AnswerRecord.model_validate_json(lines[1])
-        assert kept_other.answer == "другая"
-        assert kept_new.answer == "новый"
-
-    def test_t_mdl_10_empty_search_fills_triple(self) -> None:
-        """Пустой поиск пишет три имени, model совпадает с answer_model."""
-        harness = build_harness(empty_pairs={("doc_a.docx", "Q001")})
-        self._set_lists(harness.config, answers=["a.gguf"])
-        service = ServiceFactory().build(harness)
-        service.run(harness.run_request())
-        record = next(
-            answer
-            for answer in harness.result_sink.answers
-            if answer.doc_id == "doc_a.docx" and answer.question_id == "Q001"
-        )
-        assert record.embedding_model == "e.gguf"
-        assert record.reranker_model == "r.gguf"
-        assert record.answer_model == "a.gguf"
-        assert record.model == record.answer_model
-
-    def test_t_mdl_11_answer_flag_replaces_answer_list(self) -> None:
-        """Флаг --answer-model оставляет в запуске одну модель ответа."""
+    def test_t_mdl_15_two_embedders_keep_one_ini(self, tmp_path: Path) -> None:
+        """Два pooling в одном ini, цикл комбинаций файл не меняет."""
+        text = """
+embedding:
+  models:
+    - name: frida.gguf
+      params:
+        pooling: mean
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: cls
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+"""
+        config = AppConfig.from_yaml(self._config_path(tmp_path, text))
+        rendered = LlamaModelsIni().render(config)
+        assert "pooling = mean" in rendered
+        assert "pooling = cls" in rendered
+        ini_path = tmp_path / "models.ini"
+        LlamaModelsIni().write(config, ini_path)
+        before = ini_path.read_bytes()
         harness = build_harness()
-        self._set_lists(harness.config, answers=["a.gguf", "b.gguf"])
-        request = harness.run_request()
-        request.overrides = RunOverrides(answer_model="other.gguf")
-        service = ServiceFactory().build(harness)
-        summary = service.run(request)
-        assert summary.model_versions.answer == ["other.gguf"]
-        assert summary.model_versions.embedding == ["e.gguf"]
-        assert summary.model_versions.reranker == ["r.gguf"]
-        assert {item.answer_model for item in summary.combinations} == {"other.gguf"}
+        harness.config = config
+        summary = ServiceFactory().build(harness).run(harness.run_request(phases=["A1"]))
+        embedding_names = [item.embedding_model for item in summary.combinations]
+        assert embedding_names == ["frida.gguf", "bge-m3-q8.gguf"]
+        assert ini_path.read_bytes() == before
 
-    def test_t_mdl_12_eval_matches_each_triple(self, tmp_path: Path) -> None:
-        """Две тройки и один эталон дают два отчёта с путём кандидатов."""
-        index_dir = tmp_path / "index"
-        predictions = tmp_path / "predictions"
-        predictions.mkdir()
-        triples = [
-            ("e.gguf", "r.gguf", "a.gguf"),
-            ("e.gguf", "r.gguf", "b.gguf"),
-        ]
-        self._write_predictions(predictions / "doc.docx.jsonl", triples)
-        for embedding_name, reranker_name, _answer_name in triples:
-            path = (
-                index_dir
-                / embedding_name
-                / reranker_name
-                / "doc.docx"
-                / "candidates.jsonl"
-            )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("{}\n", encoding="utf-8")
-        reports = self._evaluate(tmp_path, index_dir, ["e.gguf"])
-        assert len(reports) == 2
-        assert all(report.n_matched == 1 for report in reports)
-        assert all(report.n_missing_candidates == 0 for report in reports)
-        assert all(
-            "e.gguf" in report.candidates_path and "r.gguf" in report.candidates_path
-            for report in reports
+    def test_t_mdl_16_bad_pooling_does_not_write_ini(self, tmp_path: Path) -> None:
+        """Нет pooling, none у эмбеддера или не rank у реранкера — ini не меняется."""
+        cases = (
+            """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+""",
+            """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: none
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+""",
+            """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: mean
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+""",
         )
+        ini_path = self._sentinel(tmp_path)
+        for index, text in enumerate(cases):
+            config_path = self._config_path(tmp_path, text, f"bad-{index}.yaml")
+            assert self._command(tmp_path, "write-models-ini", config_path, ini_path=ini_path) == 1
+        assert ini_path.read_text(encoding="utf-8") == "sentinel"
 
-    def test_t_mdl_13_duplicate_pair_in_triple_fails(self, tmp_path: Path) -> None:
-        """Повтор пары внутри тройки останавливает eval до отчёта."""
-        predictions = tmp_path / "predictions"
-        predictions.mkdir()
-        self._write_predictions(
-            predictions / "doc.docx.jsonl",
-            [("e.gguf", "r.gguf", "a.gguf"), ("e.gguf", "r.gguf", "a.gguf")],
+    def test_t_mdl_17_forbidden_and_duplicate_params(self, tmp_path: Path) -> None:
+        """Запрещённый ключ, нескаляр и повтор ключа — ошибка до фаз."""
+        forbidden_cases = (
+            """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+        embedding: true
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+""",
+            """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+        model: /models/other.gguf
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+""",
+            """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+        reranking: true
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+""",
+            """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+      params:
+        pooling: mean
+""",
         )
-        request = self._eval_request(tmp_path, tmp_path / "index", ["e.gguf"])
-        with pytest.raises(EvaluationError, match="повторяется"):
-            EvaluationRun().execute(request)
+        nested = """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+        batch-size:
+          - 1
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+"""
+        duplicated = """
+embedding:
+  models:
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: mean
+        pooling: cls
+reranker:
+  models:
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+answer:
+  models:
+    - name: Qwen3-8B-Q4_K_M.gguf
+"""
+        ini_path = self._sentinel(tmp_path)
+        texts = (*forbidden_cases, nested, duplicated)
+        for index, text in enumerate(texts):
+            config_path = self._config_path(tmp_path, text, f"forbid-{index}.yaml")
+            code = self._command(tmp_path, "write-models-ini", config_path, ini_path=ini_path)
+            assert code == 1
+        assert ini_path.read_text(encoding="utf-8") == "sentinel"
 
-    def test_t_mdl_14_cosine_uses_first_embedding(self, tmp_path: Path) -> None:
-        """Косинус обоих отчётов — первое имя embedding.models."""
-        predictions = tmp_path / "predictions"
-        predictions.mkdir()
-        self._write_predictions(
-            predictions / "doc.docx.jsonl",
-            [
-                ("second.gguf", "r.gguf", "a.gguf"),
-                ("first.gguf", "r.gguf", "a.gguf"),
-            ],
-        )
-        reports = self._evaluate(
-            tmp_path,
-            tmp_path / "index",
-            ["first.gguf", "second.gguf"],
-        )
-        assert [report.cosine_embedding_model for report in reports] == [
-            "first.gguf",
-            "first.gguf",
-        ]
+    def test_t_mdl_18_string_item_rejected(self, tmp_path: Path) -> None:
+        """Элемент списка или ключ model строкой — ошибка до фаз."""
+        listed = "embedding:\n  models:\n    - bge-m3-q8.gguf\n"
+        single = "embedding:\n  model: bge-m3-q8.gguf\n"
+        with pytest.raises(ValueError, match="объект с name"):
+            AppConfig.from_yaml(self._config_path(tmp_path, listed))
+        with pytest.raises(ValueError, match="объект с name"):
+            AppConfig.from_yaml(self._config_path(tmp_path, single, "single.yaml"))
 
-    def _set_lists(self, config: AppConfig, answers: list[str]) -> None:
-        """Подставляет короткие списки файлов в конфиг харнесса.
+    def test_t_mdl_19_unknown_flag_name(self, tmp_path: Path) -> None:
+        """Флаг с именем не из списка конфига — ошибка до фаз."""
+        config = AppConfig.from_yaml(self._config_path(tmp_path, _SECTION_TWO))
+        request = RunRequest(config=config)
+        request.overrides.answer_model = "missing.gguf"
+        with pytest.raises(ModelListError, match="missing.gguf"):
+            request.resolved_config()
+
+    def _config_path(self, root: Path, text: str, filename: str = "config.yaml") -> Path:
+        """Пишет фрагмент YAML в каталог теста.
 
         Args:
-            config: Конфиг прогона.
-            answers: Имена моделей ответа.
-        """
-        config.embedding.model = "e.gguf"
-        config.embedding.models = ["e.gguf"]
-        config.reranker.model = "r.gguf"
-        config.reranker.models = ["r.gguf"]
-        config.answer.model = answers[0]
-        config.answer.models = list(answers)
-
-    def _config(
-        self,
-        embedding: list[str],
-        reranker: list[str],
-        answer: list[str],
-    ) -> AppConfig:
-        """Собирает конфиг только со списками моделей.
-
-        Args:
-            embedding: Имена эмбеддеров.
-            reranker: Имена реранкеров.
-            answer: Имена моделей ответа.
+            root: Временный каталог.
+            text: Текст конфига.
+            filename: Имя файла.
 
         Returns:
-            AppConfig.
+            Путь к записанному файлу.
         """
-        return AppConfig.model_validate(
-            {
-                "embedding": {"models": embedding},
-                "reranker": {"models": reranker},
-                "answer": {"models": answer},
-            }
-        )
-
-    def _write_yaml(
-        self,
-        root: Path,
-        embedding: list[str],
-        reranker: list[str],
-        answer: list[str],
-    ) -> Path:
-        """Пишет минимальный YAML со списками.
-
-        Args:
-            root: Каталог теста.
-            embedding: Имена эмбеддеров.
-            reranker: Имена реранкеров.
-            answer: Имена моделей ответа.
-
-        Returns:
-            Путь к YAML.
-        """
-        payload = {
-            "embedding": {"models": embedding},
-            "reranker": {"models": reranker},
-            "answer": {"models": answer},
-        }
-        path = root / "config.yaml"
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path = root / filename
+        path.write_text(text.strip() + "\n", encoding="utf-8")
         return path
 
-    def _forbid_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Подменяет сборку приложения, чтобы фазы не стартовали.
+    def _touch(self, models: Path, *names: str) -> None:
+        """Создаёт пустые файлы GGUF для проверки каталога.
 
         Args:
-            monkeypatch: Фикстура pytest.
+            models: Каталог models.
+            names: Имена файлов.
         """
+        models.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (models / name).write_bytes(b"gguf")
 
-        def fail_build(self: Application) -> None:
-            """Падает, если проверка списков пропустила сборку."""
-            raise AssertionError("фазы не должны стартовать")
-
-        monkeypatch.setattr(Application, "build", fail_build)
-
-    def _record(self, answer: str) -> AnswerRecord:
-        """Строка ответа одной тройки.
+    def _sentinel(self, root: Path) -> Path:
+        """Кладёт ini, который ошибка записи не должна заменить.
 
         Args:
-            answer: Текст ответа.
+            root: Временный каталог.
 
         Returns:
-            AnswerRecord.
+            Путь к файлу со словом sentinel.
         """
-        return AnswerRecord(
-            doc_id="doc_a.docx",
-            question_id="Q001",
-            category="Срок",
-            answer=answer,
-            embedding_model="e.gguf",
-            reranker_model="r.gguf",
-            answer_model="a.gguf",
-            model="a.gguf",
-        )
+        path = root / "models.ini"
+        path.write_text("sentinel", encoding="utf-8")
+        return path
 
-    def _write_predictions(
-        self,
-        path: Path,
-        triples: list[tuple[str, str, str]],
-    ) -> None:
-        """Пишет по строке на тройку для одной пары документа и вопроса.
-
-        Args:
-            path: Файл jsonl.
-            triples: Тройки моделей.
-        """
-        lines = []
-        for embedding_name, reranker_name, answer_name in triples:
-            record = AnswerRecord(
-                doc_id="doc.docx",
-                question_id="Q1",
-                category="Срок",
-                embedding_model=embedding_name,
-                reranker_model=reranker_name,
-                answer_model=answer_name,
-                model=answer_name,
-            )
-            lines.append(record.model_dump_json())
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    def _eval_request(
+    def _command(
         self,
         root: Path,
-        index_dir: Path,
-        embedding_names: list[str],
-    ) -> EvalRequest:
-        """Собирает запрос eval с одним эталоном.
+        command: str,
+        config_path: Path,
+        models: Path | None = None,
+        ini_path: Path | None = None,
+    ) -> int:
+        """Запускает команду CLI с подменёнными путями моделей и ini.
 
         Args:
-            root: Каталог предсказаний и эталона.
-            index_dir: Корень кандидатов.
-            embedding_names: Список эмбеддеров конфига.
+            root: Временный каталог, если пути не заданы.
+            command: run или write-models-ini.
+            config_path: YAML конфига.
+            models: Каталог GGUF.
+            ini_path: Файл пресета.
 
         Returns:
-            EvalRequest.
+            Код выхода.
         """
-        ground_truth = root / "gt.json"
-        ground_truth.write_text(
-            json.dumps(
-                [
-                    {
-                        "doc_id": "doc.docx",
-                        "question_id": "Q1",
-                        "expected_found": True,
-                        "expected_answer": "год",
-                    }
-                ]
-            ),
-            encoding="utf-8",
-        )
-        config = AppConfig.model_validate(
-            {
-                "embedding": {"models": embedding_names},
-                "phases": {"index_dir": str(index_dir)},
-            }
-        )
-        return EvalRequest(
-            config=config,
-            ground_truth_path=str(ground_truth),
-            predictions_dir=str(root / "predictions"),
-        )
-
-    def _evaluate(
-        self,
-        root: Path,
-        index_dir: Path,
-        embedding_names: list[str],
-    ) -> list[EvalReport]:
-        """Запускает группировку eval.
-
-        Args:
-            root: Каталог предсказаний и эталона.
-            index_dir: Корень кандидатов.
-            embedding_names: Список эмбеддеров конфига.
-
-        Returns:
-            Отчёты троек.
-        """
-        return EvaluationRun().execute(
-            self._eval_request(root, index_dir, embedding_names)
-        )
+        app = CliApp()
+        app.models_dir = models or (root / "models")
+        app.models_ini_path = ini_path or (root / "models.ini")
+        argv = [command, "--config", str(config_path)]
+        if command == "run":
+            argv.extend(["--phase", "A1"])
+        return app.main(argv)

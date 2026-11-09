@@ -5,14 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from models.config import AppConfig
-
-
-class ModelListError(Exception):
-    """Список имён или файл модели не прошёл проверку до фаз."""
+from models.model_list import ModelListError, ModelPreset, ModelPresetRules
 
 
 class ModelIniError(Exception):
-    """Файл models.ini не совпадает со списками конфига."""
+    """models.ini переписан; контейнер inference должен перечитать пресет."""
 
 
 class ModelCatalog:
@@ -34,34 +31,37 @@ class ModelCatalog:
         """Проверяет три списка и наличие файлов.
 
         Args:
-            config: Конфиг после подмены флагов CLI.
+            config: Полный конфиг файла, до сужения списков флагами CLI.
 
         Raises:
-            ModelListError: Пустой список, плохое имя, дубликат или нет файла.
+            ModelListError: Пустой список, параметры, дубликат или нет файла.
         """
+        rules = ModelPresetRules()
         roles = (
-            ("embedding", list(config.embedding.models or [])),
-            ("reranker", list(config.reranker.models or [])),
-            ("answer", list(config.answer.models or [])),
+            ("embedding", config.embedding),
+            ("reranker", config.reranker),
+            ("answer", config.answer),
         )
         seen_global: dict[str, str] = {}
-        for role, names in roles:
-            if not names:
+        for role, section in roles:
+            presets = rules.read(section)
+            if not presets:
                 raise ModelListError(f"список {role} пуст")
             seen_role: set[str] = set()
-            for name in names:
-                self._check_name(name)
-                if name in seen_role:
-                    raise ModelListError(f"имя {name} повторяется в списке {role}")
-                seen_role.add(name)
-                previous = seen_global.get(name)
+            for preset in presets:
+                self._check_name(preset.name)
+                rules.check(role, preset)
+                if preset.name in seen_role:
+                    raise ModelListError(f"имя {preset.name} повторяется в списке {role}")
+                seen_role.add(preset.name)
+                previous = seen_global.get(preset.name)
                 if previous is not None:
                     raise ModelListError(
-                        f"имя {name} стоит в ролях {previous} и {role}"
+                        f"имя {preset.name} стоит в ролях {previous} и {role}"
                     )
-                seen_global[name] = role
-                if not (self.models_dir / name).is_file():
-                    raise ModelListError(f"нет файла models/{name}")
+                seen_global[preset.name] = role
+                if not (self.models_dir / preset.name).is_file():
+                    raise ModelListError(f"нет файла models/{preset.name}")
 
     def _check_name(self, name: str) -> None:
         """Проверяет, что имя — один файл .gguf.
@@ -82,7 +82,10 @@ class ModelCatalog:
 
 
 class LlamaModelsIni:
-    """Собирает текст deploy/llama/models.ini из списков конфига."""
+    """Собирает текст deploy/llama/models.ini из списков конфига.
+
+    Для команды run при расхождении пишет файл и останавливает прогон.
+    """
 
     def render(self, config: AppConfig) -> str:
         """Строит канонический текст пресета.
@@ -93,26 +96,63 @@ class LlamaModelsIni:
         Returns:
             Текст ini с завершающим переводом строки.
         """
+        rules = ModelPresetRules()
         blocks = ["[*]\nctx-size = 4096"]
-        for name in config.embedding.models or []:
-            blocks.append(
-                f"[{name}]\nmodel = /models/{name}\nembedding = true"
+        blocks.extend(
+            self._sections(
+                rules.read(config.embedding),
+                ["embedding = true"],
             )
-        for name in config.reranker.models or []:
-            blocks.append(
-                "\n".join(
-                    [
-                        f"[{name}]",
-                        f"model = /models/{name}",
-                        "embedding = true",
-                        "reranking = true",
-                        "pooling = rank",
-                    ]
-                )
+        )
+        blocks.extend(
+            self._sections(
+                rules.read(config.reranker),
+                ["embedding = true", "reranking = true"],
             )
-        for name in config.answer.models or []:
-            blocks.append(f"[{name}]\nmodel = /models/{name}")
+        )
+        blocks.extend(self._sections(rules.read(config.answer), []))
         return "\n\n".join(blocks) + "\n"
+
+    def _sections(self, presets: list[ModelPreset], role_flags: list[str]) -> list[str]:
+        """Собирает секции роли: путь, флаги роли, затем params.
+
+        Args:
+            presets: Записи роли в порядке конфига.
+            role_flags: Строки, которые роль пишет сама.
+
+        Returns:
+            Тексты секций без разделительной пустой строки.
+        """
+        blocks: list[str] = []
+        for preset in presets:
+            lines = [f"[{preset.name}]", f"model = /models/{preset.name}"]
+            lines.extend(role_flags)
+            for key, value in preset.params.items():
+                lines.append(f"{key} = {self._format_value(value)}")
+            blocks.append("\n".join(lines))
+        return blocks
+
+    def _format_value(self, value: object) -> str:
+        """Пишет скаляр params одной строкой ini.
+
+        Args:
+            value: Строка, целое, число или логическое.
+
+        Returns:
+            Текст справа от знака равенства.
+        """
+        if isinstance(value, bool):
+            if value:
+                return "true"
+            return "false"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            text = format(value, "f").rstrip("0").rstrip(".")
+            if "." not in text:
+                text = f"{text}.0"
+            return text
+        return str(value)
 
     def write(self, config: AppConfig, path: str | Path) -> None:
         """Перезаписывает файл каноническим текстом.
@@ -125,21 +165,27 @@ class LlamaModelsIni:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(self.render(config), encoding="utf-8")
 
-    def ensure_matches(self, config: AppConfig, path: str | Path) -> None:
-        """Останавливает прогон, если файл не равен каноническому тексту.
+    def prepare_for_run(self, config: AppConfig, path: str | Path) -> None:
+        """Пишет канонический текст при расхождении и тогда останавливает прогон.
 
         Args:
             config: Конфиг со списками.
             path: Путь к models.ini.
 
         Raises:
-            ModelIniError: Файла нет или текст другой.
+            ModelIniError: Текст файла отличался; после записи контейнер
+                inference должен перечитать пресет.
         """
         target = Path(path)
         actual = target.read_text(encoding="utf-8") if target.is_file() else ""
-        if actual != self.render(config):
-            raise ModelIniError(
-                "models.ini не совпадает со списками конфига. "
-                "Перезапишите его командой write-models-ini "
-                "и пересоздайте контейнер inference, чтобы он перечитал пресет."
-            )
+        canonical = self.render(config)
+        if actual == canonical:
+            return
+        self.write(config, path)
+        raise ModelIniError(
+            "models.ini обновлён по спискам конфига.\n"
+            "Пересоздайте контейнер inference, чтобы он перечитал пресет, "
+            "затем повторите run:\n"
+            "\n"
+            "  docker compose --profile poc up -d --force-recreate inference"
+        )

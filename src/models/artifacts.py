@@ -151,7 +151,7 @@ class AnswerRecord(BaseModel):
         latency_ms: Задержка ответа.
         status: Статус пары.
         verification_skipped: Верификация была пропущена.
-        prepared_context: Промпт с фрагментами, если модель не ответила.
+        prepared_context: Всегда None. Промпт пишется в отладочный дамп, не в jsonl.
     """
 
     doc_id: str

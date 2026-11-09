@@ -11,7 +11,7 @@
 3. Положить документы в `experiments/documents/`.
 4. Записать вопросы в `experiments/questions.json` и проверить файл.
 5. Скачать GGUF в `models/` и вписать имена этих файлов в списки `config.yaml`.
-6. Поднять контейнер с моделями и запустить прогон. Ответы лежат в `experiments/results/`.
+6. Поднять контейнер с моделями и запустить прогон. Если `run` переписал `deploy/llama/models.ini`, пересоздать `inference` и повторить прогон. Ответы лежат в `experiments/results/`.
 
 ## 1. Поставить Docker и доступ к видеокарте
 
@@ -70,7 +70,7 @@ PDF нужен с текстовым слоем: скан без текста п
 
 В `category` пишите сам вопрос: его получит модель, и по нему будет формулироваться ответ.
 
-В `synonyms` пишите, как этот факт может выглядеть в документе: абзац или две-три фразы в тех словах, в каких пункт встречается в договоре, политике или отчёте. Несколько синонимов — несколько таких заготовок, если в разных файлах одна и та же мысль записана по-разному. Поиск идёт по каждой заготовке отдельно и берёт лучшее совпадение. Модель при этом отвечает на один текст — `category`.
+В `synonyms` пишите, как этот факт может выглядеть в документе: абзац или две-три фразы в тех словах, в каких пункт встречается в договоре, политике или отчёте. Несколько синонимов — несколько таких заготовок, если в разных файлах одна и та же мысль записана по-разному. Поиск идёт по каждой заготовке отдельно и берёт лучшее совпадение. Реранк по умолчанию (`reranker.query_strategy: category`) скорит только `category`. Значение `synonyms_rerank` сравнивает чанки и с синонимами. Модель при этом отвечает на один текст — `category`.
 
 ```json
 {
@@ -103,29 +103,33 @@ docker compose exec app python -c "from ports.file_sources import FileQuestionSo
 
 Нужны файлы GGUF трёх ролей. В одном прогоне их может быть несколько: прогон идёт по очереди, в каждый момент загружена одна модель.
 
-| Роль | Список в `config.yaml` | Что это за модель |
+| Роль | Список в `config.yaml` | Что попадает в секцию ini |
 |---|---|---|
-| Эмбеддинги, индексация | `embedding.models` | Модель эмбеддингов. В секции ini будет `embedding = true` |
-| Реранк, поиск | `reranker.models` | Модель, которую llama-server считает реранкером. В секции: `embedding = true`, `reranking = true`, `pooling = rank` |
-| Ответ | `answer.models` | Обычная чат-модель. Флагов эмбеддинга в секции нет |
+| Эмбеддинги, индексация | `embedding.models` | `embedding = true` и `params` этой модели. Обязателен `pooling`: `mean`, `cls` или `last` |
+| Реранк, поиск | `reranker.models` | `embedding = true`, `reranking = true` и `params`. Обязателен `pooling: rank` |
+| Ответ | `answer.models` | Путь к файлу. `params` необязательны, например свой `ctx-size` |
 
-Имя в списке — имя файла в `models/`, с суффиксом `.gguf`. Одно и то же имя нельзя поставить дважды и нельзя отдать двум ролям. `python main.py run` до старта фаз проверяет все три списка и останавливается, если какого-то файла нет. Это относится и к `--phase A1`: индексация считает эмбеддинги кусков файлом из `embedding.models`, а файлы реранкера и ответа к этому моменту уже лежат в `models/`, потому что проверка и `models.ini` собираются по всему конфигу.
+`name` — имя файла в `models/`, с суффиксом `.gguf`. Одно и то же имя нельзя поставить дважды и нельзя отдать двум ролям. `python main.py run` до старта фаз проверяет все три списка и останавливается, если какого-то файла нет. Это относится и к `--phase A1`: индексация считает эмбеддинги кусков файлом из `embedding.models`, а файлы реранкера и ответа к этому моменту уже лежат в `models/`, потому что проверка и сборка `models.ini` идут по всему конфигу.
 
 Пример в репозитории — по одному файлу:
 
 ```yaml
 embedding:
   models:
-    - embed.gguf
+    - name: embed.gguf
+      params:
+        pooling: mean
 reranker:
   models:
-    - rerank.gguf
+    - name: rerank.gguf
+      params:
+        pooling: rank
 answer:
   models:
-    - answer.gguf
+    - name: answer.gguf
 ```
 
-Несколько моделей — несколько строк в списке. Прогон перебирает эмбеддеры, для каждого — реранкеры, для каждой пары — модели ответа. В строке ответа остаются имена этой тройки: `embedding_model`, `reranker_model`, `answer_model`.
+Несколько моделей — несколько записей в списке. У каждой свои `params`. Прогон перебирает эмбеддеры, для каждого — реранкеры, для каждой пары — модели ответа. Контейнер `inference` при этом не перезапускается: все секции уже прочитаны при его старте, а прогон только загружает и выгружает одну модель. В строке ответа остаются имена этой тройки: `embedding_model`, `reranker_model`, `answer_model`.
 
 Проект конкретный репозиторий на Hugging Face не фиксирует. Качается на хосте, пакет `huggingface_hub`:
 
@@ -138,7 +142,7 @@ mkdir -p models
 
 ### Имена из примера
 
-`config.yaml` и `deploy/llama/models.ini` уже согласованы на `embed.gguf`, `rerank.gguf` и `answer.gguf`. Каталог `/models` внутри контейнера — это `models/` на хосте.
+Каталог `/models` внутри контейнера — это `models/` на хосте. Ниже файлы для краткости переименовываются в `embed.gguf`, `rerank.gguf` и `answer.gguf`; в рабочем `config.yaml` репозитория стоят другие имена — как файлы, которые вы положили в `models/`. `run` сам соберёт `deploy/llama/models.ini` под списки конфига.
 
 ```bash
 huggingface-cli download ORG/EMBED-GGUF embed-file.gguf --local-dir /tmp/gguf
@@ -165,24 +169,34 @@ cp /path/to/Qwen3-8B-Q4_K_M.gguf models/Qwen3-8B-Q4_K_M.gguf
 ```yaml
 embedding:
   models:
-    - bge-m3-q8.gguf
+    - name: bge-m3-q8.gguf
+      params:
+        pooling: cls
 reranker:
   models:
-    - bge-reranker.gguf
-    - qwen-reranker.gguf
+    - name: bge-reranker.gguf
+      params:
+        pooling: rank
+    - name: qwen-reranker.gguf
+      params:
+        pooling: rank
 answer:
   models:
-    - Qwen3-8B-Q4_K_M.gguf
+    - name: Qwen3-8B-Q4_K_M.gguf
 ```
 
-Ini руками не правят. Команда перезаписывает `deploy/llama/models.ini` по спискам: заголовок секции и поле `model` равны имени файла, путь внутри контейнера — `/models/<имя>`.
+Ini руками не правят. `run` сравнивает `deploy/llama/models.ini` со всеми записями конфига и при расхождении сам перезаписывает файл. Заголовок секции и поле `model` равны имени файла, путь внутри контейнера — `/models/<имя>`, ниже флаги роли и `params` этой записи.
+
+После правки списков или `params` первый `run` пишет ini и останавливается: llama-server читает пресет только при старте, а из контейнера `app` Docker недоступен. Образы пересобирать не нужно. С хоста пересоздайте `inference` и повторите `run`:
 
 ```bash
-docker compose exec app python main.py write-models-ini --config config.yaml
-docker compose --profile poc up -d inference
+docker compose exec app python main.py run --config config.yaml
+# если процесс остановился с сообщением про models.ini:
+docker compose --profile poc up -d --force-recreate inference
+docker compose exec app python main.py run --config config.yaml
 ```
 
-`run` сравнивает ini со списками и останавливается, если текст другой. После правки списков снова `write-models-ini` и пересоздание `inference`. Окно контекста задаёт `ctx-size` в секции `[*]`, сейчас `4096`.
+Пока текст ini тот же, следующий прогон идёт в уже запущенный контейнер. Окно контекста по умолчанию задаёт `ctx-size` в секции `[*]`, сейчас `4096`. Свой `ctx-size` в `params` модели перекрывает его только у этой секции. Отдельная команда `write-models-ini` пишет тот же файл без прогона, если ini нужен до первого `up`.
 
 ## 6. Запустить прогон
 
@@ -200,20 +214,25 @@ docker compose --profile poc up -d
 docker compose exec app python main.py run --config config.yaml
 ```
 
+Если списки или `params` разошлись с `deploy/llama/models.ini`, эта команда обновит файл и выйдет. Тогда с хоста пересоздайте `inference` командой из сообщения и повторите `run`. Пока ini совпадает с конфигом, фазы стартуют сразу.
+
 Только индексация, с пересчётом уже готовых кусков:
 
 ```bash
 docker compose exec app python main.py run --config config.yaml --phase A1 --force-phase A1
 ```
 
-Для имён из `config.yaml` до этой команды в `models/` уже лежат `embed.gguf`, `rerank.gguf` и `answer.gguf`. A1 загружает `embed.gguf` и пишет векторы кусков в `experiments/emb/embed.gguf/<имя документа>/`.
+До этой команды в `models/` уже лежат все файлы из трёх списков `config.yaml`. A1 загружает имя из `embedding.models` и пишет векторы кусков в `experiments/emb/<это имя>/<имя документа>/`.
 
 Список фаз задаёт `--phase`. Без флага выполняются `A1,A2,B`. Поля `phases.run_a1`, `run_a2` и `run_b` в `config.yaml` на список не влияют. Файл вопросов читается, когда в списке есть A2 или B.
 
 В конце процесса печатается строка `run complete documents=… questions=… error_rate=…`.
 
+При `runtime.log_level: WARNING` в консоли виден отказ документа: стадия, идентификатор и причина. `INFO` добавляет границы стадий. `DEBUG` дописывает короткий `debug_payload` в строку трассы и складывает промежуточные файлы в `experiments/debug/`: extract, clean, чанки, поиск, контекст, промпт, каждую попытку модели и итог пары.
+
 Ответы:
 
+- `experiments/results/<имя файла>.md` — текст для чтения. В блоке вопрос, ответ и пояснение, без цитат и промпта.
 - `experiments/results/<имя файла>.jsonl` — строки пар «документ × вопрос». Одна тройка моделей даёт свою строку; в ней `embedding_model`, `reranker_model` и `answer_model`. Текст ответа в поле `answer`, признак в `found`, страницы и цитата в `citations` (`page_from`, `page_to`, `section_path`, `quote`).
 - `experiments/results/run_summary.json` — сколько документов и вопросов было в прогоне, счётчики фаз `computed`, `skipped`, `failed` и список `combinations` по тройкам.
 
@@ -223,7 +242,7 @@ docker compose exec app python main.py run --config config.yaml --phase A1 --for
 
 Если поиск ничего не нашёл, модель не вызывается, а в `answer` будет фраза «В поиске по этому вопросу ничего не найдено.»
 
-`failed` у фазы A1 в сводке обычно значит, что файл не разобрался: чаще всего это PDF без текстового слоя.
+`failed` у фазы A1 в сводке значит, что документ не дошёл до векторов. Причина в той же консоли, строкой warning: `no_text_layer`, `zero_chunks` или текст исключения.
 
 Первый прогон считает эмбеддинги всех кусков и может идти долго. Следующий запуск с теми же файлами фазы пропускает: в сводке это `skipped`.
 

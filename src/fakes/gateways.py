@@ -25,16 +25,22 @@ class FakeEmbeddingGateway(EmbeddingGateway):
         load_calls: Число load.
         unload_calls: Число unload.
         infer_calls: Список запросов infer.
+        raise_error: Если задано — infer бросает это исключение.
     """
 
     name = "embedding"
 
-    def __init__(self) -> None:
-        """Инициализирует счётчики."""
+    def __init__(self, raise_error: Exception | None = None) -> None:
+        """Инициализирует счётчики.
+
+        Args:
+            raise_error: Исключение infer или None.
+        """
         super().__init__()
         self.load_calls = 0
         self.unload_calls = 0
         self.infer_calls: list[EmbedRequest] = []
+        self.raise_error = raise_error
 
     def load(self) -> None:
         """Помечает шлюз загруженным."""
@@ -57,9 +63,12 @@ class FakeEmbeddingGateway(EmbeddingGateway):
 
         Raises:
             RuntimeError: Шлюз не загружен.
+            Exception: Если задан raise_error.
         """
         if not self.loaded:
             raise RuntimeError("EmbeddingGateway не загружен")
+        if self.raise_error is not None:
+            raise self.raise_error
         self.infer_calls.append(request)
         vector = struct.pack("<e", 1.0)
         items = [

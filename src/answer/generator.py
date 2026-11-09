@@ -7,6 +7,7 @@ import time
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
+from answer.exchange import AnswerExchange, ModelAttempt
 from models.artifacts import (
     AnswerRecord,
     Citation,
@@ -121,6 +122,7 @@ class AnswerGenerator(AnswerGeneratorPort):
         answer_config: Параметры ответа, кроме лимита длины.
         runtime_config: Число попыток и пауза между ними.
         llm: Уже загруженный фазой шлюз.
+        exchange: Промпт и попытки последнего generate. В jsonl не пишутся.
     """
 
     _empty_answer = "В поиске по этому вопросу ничего не найдено."
@@ -146,6 +148,7 @@ class AnswerGenerator(AnswerGeneratorPort):
         self.llm = llm
         self.embedding_model = ""
         self.reranker_model = ""
+        self.exchange = AnswerExchange()
 
     def _combination(self) -> dict[str, str]:
         """Имена файлов текущей тройки для строки ответа.
@@ -176,13 +179,17 @@ class AnswerGenerator(AnswerGeneratorPort):
 
         Returns:
             Запись со status ok или failed. Исключения шлюза наружу не идут.
+            Промпт и попытки остаются в self.exchange, не в записи.
         """
         del questions
+        self.exchange = AnswerExchange()
         if bundle.empty_search:
             return self._not_found(bundle, question, response=None)
         prompt = self._build_prompt(bundle, question)
+        self.exchange.prompt = prompt
         last_response: GenerateResponse | None = None
         attempt_index = 0
+        fragment_count = len(bundle.candidates)
         while attempt_index < self.runtime_config.retries:
             # Пауза только между попытками, не перед первой и не после последней.
             if attempt_index > 0:
@@ -190,17 +197,23 @@ class AnswerGenerator(AnswerGeneratorPort):
             attempt_index += 1
             try:
                 response = self._call_model(prompt, bundle, question)
-            except Exception:  # noqa: BLE001 — любая ошибка шлюза это неудачная попытка
+            except Exception as error:  # noqa: BLE001 — любая ошибка шлюза это неудачная попытка
+                self.exchange.attempts.append(
+                    ModelAttempt(attempt_index, "exception", "", str(error))
+                )
                 continue
             last_response = response
-            parsed = self._parse(response.text, len(bundle.candidates))
+            parsed, outcome, error_text = self._classify(response.text, fragment_count)
+            self.exchange.attempts.append(
+                ModelAttempt(attempt_index, outcome, response.text, error_text)
+            )
             if parsed is None:
                 continue
             # Пустые цитаты при found=true — не найденный ответ и не повод повторять.
             if parsed.found and not parsed.citations:
                 return self._not_found(bundle, question, response=response)
             return self._from_model(bundle, question, parsed, response)
-        return self._unavailable(bundle, question, prompt, last_response)
+        return self._unavailable(bundle, question, last_response)
 
     def _call_model(
         self,
@@ -237,14 +250,14 @@ class AnswerGenerator(AnswerGeneratorPort):
         time.sleep(seconds)
 
     def _build_prompt(self, bundle: ContextBundle, question: Question) -> str:
-        """Собирает промпт: вопрос, схема JSON и фрагменты с 1.
+        """Собирает промпт: вопрос, схема JSON, фрагменты с 1 и пример ответа.
 
         Args:
             bundle: Непустой бандл.
             question: Вопрос; в текст берётся category.
 
         Returns:
-            Промпт одним блоком.
+            Промпт одним блоком. В конце — фиксированный JSON из спецификации.
         """
         lines = [
             f"Вопрос: {question.category}",
@@ -270,7 +283,31 @@ class AnswerGenerator(AnswerGeneratorPort):
             lines.append(self._heading(index, fragment))
             lines.append(fragment.text)
             lines.append("")
+        # Пример фиксированный: это форма JSON, а не фрагмент документа.
+        lines.append("Пример ответа:")
+        lines.append(self._answer_example())
         return "\n".join(lines).rstrip() + "\n"
+
+    def _answer_example(self) -> str:
+        """Возвращает один успешный JSON для конца промпта.
+
+        Returns:
+            Объект схемы без ограждения и без завершающего перевода строки.
+            Ключи в порядке схемы, отступ два пробела.
+        """
+        payload = {
+            "found": True,
+            "answer": "текст ответа на вопрос",
+            "explanation": "пояснение и обоснование отдельно от ответа",
+            "reason": None,
+            "citations": [
+                {
+                    "n": 1,
+                    "quote": "цитата из фрагмента",
+                }
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _heading(self, number: int, fragment: ContextCandidate) -> str:
         """Заголовок фрагмента в промпте. Это не префикс поля text бандла.
@@ -334,31 +371,60 @@ class AnswerGenerator(AnswerGeneratorPort):
         ordered.sort(key=lambda fragment: fragment.rank_after_rerank)
         return ordered
 
-    def _parse(self, raw_text: str, fragment_count: int) -> ModelAnswer | None:
-        """Разбирает один JSON-объект. Ограда и чужие поля — неудача.
+    def _classify(
+        self,
+        raw_text: str,
+        fragment_count: int,
+    ) -> tuple[ModelAnswer | None, str, str | None]:
+        """Разбирает ответ и называет причину неудачи.
 
         Args:
             raw_text: Текст ответа модели.
             fragment_count: Сколько фрагментов было в промпте.
 
         Returns:
-            ModelAnswer или None, если попытку надо повторить.
+            Разобранный ответ или None, код исхода и текст ошибки.
+            У ok и empty текст ошибки пустой. Одна ограда вокруг
+            всего текста снимается до разбора JSON.
         """
         stripped = raw_text.strip()
         if not stripped:
-            return None
+            return None, "empty", None
+        # Одна ограда — привычка чат-модели. Внутри лежит тот же JSON.
+        stripped = self._unwrap_fence(stripped)
         try:
             payload = json.loads(stripped)
-        except json.JSONDecodeError:
-            return None
+        except json.JSONDecodeError as error:
+            return None, "invalid_json", str(error)
         try:
             parsed = ModelAnswer.model_validate(payload)
-        except ValidationError:
-            return None
+        except ValidationError as error:
+            return None, "invalid_schema", str(error)
         for citation in parsed.citations:
             if citation.n < 1 or citation.n > fragment_count:
-                return None
-        return parsed
+                return None, "citation_range", "номер цитаты вне диапазона"
+        return parsed, "ok", None
+
+    def _unwrap_fence(self, text: str) -> str:
+        """Снимает одну ограду markdown, если она оборачивает весь ответ.
+
+        Args:
+            text: Ответ модели после strip.
+
+        Returns:
+            Текст внутри ограды без крайних пробелов. Если ограды нет
+            или она не единственная обёртка — исходная строка.
+        """
+        lines = text.splitlines()
+        if len(lines) < 3:
+            return text
+        opening = lines[0].strip()
+        closing = lines[-1].strip()
+        if closing != "```":
+            return text
+        if opening != "```" and opening.lower() != "```json":
+            return text
+        return "\n".join(lines[1:-1]).strip()
 
     def _not_found(
         self,
@@ -442,7 +508,6 @@ class AnswerGenerator(AnswerGeneratorPort):
         self,
         bundle: ContextBundle,
         question: Question,
-        prompt: str,
         response: GenerateResponse | None,
     ) -> AnswerRecord:
         """Запись, когда годный JSON так и не получен.
@@ -450,12 +515,12 @@ class AnswerGenerator(AnswerGeneratorPort):
         Args:
             bundle: Бандл пары.
             question: Вопрос.
-            prompt: Промпт, который уходил в модель.
             response: Последний GenerateResponse или None, если каждый
                 вызов только бросил исключение.
 
         Returns:
-            AnswerRecord со status failed. Исключения нет.
+            AnswerRecord со status failed и prepared_context=None.
+            Промпт остаётся в exchange. Исключения нет.
         """
         usage, latency_ms = self._usage(response)
         return AnswerRecord(
@@ -475,7 +540,7 @@ class AnswerGenerator(AnswerGeneratorPort):
             latency_ms=latency_ms,
             status="failed",
             verification_skipped=False,
-            prepared_context=prompt,
+            prepared_context=None,
         )
 
     def _citations(

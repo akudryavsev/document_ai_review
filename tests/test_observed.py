@@ -1,12 +1,17 @@
-"""T-OBS: декоратор Observed."""
+"""T-OBS: декоратор Observed и LoggingTraceSink."""
 
 from __future__ import annotations
 
+import logging
+
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from fakes.trace import RecordingTraceSink
+from models.config import RuntimeConfig
+from models.observe import TraceEvent
 from observe import Observed
+from observe.logging_sink import LoggingTraceSink
 
 
 class SamplePayload(BaseModel):
@@ -55,8 +60,29 @@ class SampleService:
         raise RuntimeError("boom")
 
 
+class ListLogHandler(logging.Handler):
+    """Копит LogRecord для проверки уровня sink.
+
+    Attributes:
+        records: Записи, которые принял handler.
+    """
+
+    def __init__(self) -> None:
+        """Создаёт пустой список записей."""
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Сохраняет запись.
+
+        Args:
+            record: LogRecord.
+        """
+        self.records.append(record)
+
+
 class TestObserved:
-    """Каталог T-OBS-01…02."""
+    """Каталог T-OBS-01…05."""
 
     def test_t_obs_01_success_emits_started_and_ok(self) -> None:
         """Успешный метод пишет started и ok с duration_ms."""
@@ -81,3 +107,48 @@ class TestObserved:
         assert failed.stage == "sample_fail"
         assert failed.error == "boom"
         assert failed.duration_ms is not None
+
+    def test_t_obs_04_failed_is_warning_and_debug_payload_is_gated(self) -> None:
+        """failed пишется как warning, debug_payload виден только на DEBUG."""
+        logger = logging.getLogger("observe.trace.t_obs_04")
+        logger.handlers.clear()
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        handler = ListLogHandler()
+        logger.addHandler(handler)
+        sink = LoggingTraceSink(logger)
+        sink.emit(
+            TraceEvent(
+                stage="A1",
+                status="failed",
+                doc_id="doc.pdf",
+                error="no_text_layer",
+                debug_payload="скрытый текст",
+            )
+        )
+        sink.emit(
+            TraceEvent(
+                stage="A1",
+                status="ok",
+                debug_payload="скрытый текст",
+            )
+        )
+        assert handler.records[0].levelno == logging.WARNING
+        assert "no_text_layer" in handler.records[0].getMessage()
+        assert "скрытый текст" not in handler.records[0].getMessage()
+        assert handler.records[1].levelno == logging.INFO
+        assert "скрытый текст" not in handler.records[1].getMessage()
+        logger.setLevel(logging.DEBUG)
+        sink.emit(
+            TraceEvent(
+                stage="A1",
+                status="ok",
+                debug_payload="видимый текст",
+            )
+        )
+        assert "видимый текст" in handler.records[2].getMessage()
+
+    def test_t_obs_05_unknown_log_level_rejected(self) -> None:
+        """Чужое имя уровня не проходит конфигурацию."""
+        with pytest.raises(ValidationError, match="log_level"):
+            RuntimeConfig(log_level="VERBOSE")

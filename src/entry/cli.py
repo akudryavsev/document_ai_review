@@ -17,7 +17,17 @@ from runs.evaluation import EvaluationError
 
 
 class CliApp:
-    """Разбор argv → RunRequest/EvalRequest → Application."""
+    """Разбор argv → RunRequest/EvalRequest → Application.
+
+    Attributes:
+        models_dir: Каталог GGUF для проверки до фаз.
+        models_ini_path: Файл пресета, который читает контейнер inference.
+    """
+
+    def __init__(self) -> None:
+        """Ставит пути каталога моделей и models.ini от корня репозитория."""
+        self.models_dir = Path("models")
+        self.models_ini_path = Path("deploy/llama/models.ini")
 
     def main(self, argv: list[str]) -> int:
         """Точка входа процесса.
@@ -95,8 +105,10 @@ class CliApp:
         """
         try:
             config = AppConfig.from_yaml(namespace.config)
-        except ValidationError as error:
+        except (ValidationError, ValueError) as error:
             print(str(error), file=sys.stderr)
+            return 1
+        if not self._accept_models(config, check_ini=True):
             return 1
         phases = self._parse_phases(namespace.phase)
         force_phases = {
@@ -117,8 +129,10 @@ class CliApp:
                 index_dir=namespace.index_dir,
             ),
         )
-        resolved = request.resolved_config()
-        if not self._accept_models(resolved, check_ini=True):
+        try:
+            resolved = request.resolved_config()
+        except ModelListError as error:
+            print(str(error), file=sys.stderr)
             return 1
         service = Application(resolved).build()
         summary = service.run(request)
@@ -169,30 +183,30 @@ class CliApp:
         """
         try:
             config = AppConfig.from_yaml(namespace.config)
-        except ValidationError as error:
+        except (ValidationError, ValueError) as error:
             print(str(error), file=sys.stderr)
             return 1
         if not self._accept_models(config, check_ini=False):
             return 1
-        LlamaModelsIni().write(config, Path("deploy/llama/models.ini"))
+        LlamaModelsIni().write(config, self.models_ini_path)
         return 0
 
     def _accept_models(self, config: AppConfig, check_ini: bool) -> bool:
-        """Проверяет файлы моделей и, для run, совпадение ini.
+        """Проверяет файлы моделей и, для run, готовит ini.
 
         Args:
-            config: Конфиг после подмены флагов CLI.
-            check_ini: Сравнивать deploy/llama/models.ini.
+            config: Полный конфиг файла, до сужения списков флагами CLI.
+            check_ini: Сверить и при расхождении записать models.ini.
 
         Returns:
-            True, если проверки прошли.
+            True, если проверки прошли и ini уже совпадает с конфигом.
         """
         try:
-            ModelCatalog(Path("models")).check(config)
+            ModelCatalog(self.models_dir).check(config)
             if check_ini:
-                LlamaModelsIni().ensure_matches(
+                LlamaModelsIni().prepare_for_run(
                     config,
-                    Path("deploy/llama/models.ini"),
+                    self.models_ini_path,
                 )
         except (ModelListError, ModelIniError) as error:
             print(str(error), file=sys.stderr)

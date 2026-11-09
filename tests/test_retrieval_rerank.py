@@ -13,7 +13,7 @@ from fakes.trace import RecordingTraceSink
 from gate import ArtifactGate
 from gpu import GpuLease
 from models.artifacts import ArtifactMeta
-from models.config import AppConfig
+from models.config import AppConfig, RerankerConfig
 from models.documents import CandidateBatch, CandidateRecord, ChunkBatch, ChunkRecord
 from models.phases import PhaseContext, PhasePlan, PhasePlanItem, ReuseDecision
 from models.questions import Question, QuestionSet
@@ -25,7 +25,7 @@ from store.memory_store import InMemoryArtifactStore
 
 
 class TestRetrievalRerank:
-    """Каталог T-RNK и T-RET-13/14."""
+    """Каталог T-RNK и T-RET-13/14, T-RNK-12/13."""
 
     def test_t_ret_13_persist_before_rerank(self, tmp_path: Path) -> None:
         """candidates.jsonl — выходы search без rerank_score."""
@@ -124,7 +124,7 @@ class TestRetrievalRerank:
         assert assembler.calls[0][2] is True
 
     def test_t_rnk_02_four_pairs(self) -> None:
-        """Два варианта × два чанка — четыре пары."""
+        """synonyms_rerank: два варианта × два чанка — четыре пары."""
         store = InMemoryArtifactStore()
         chunks = ChunkBatch(
             doc_id="doc",
@@ -135,6 +135,7 @@ class TestRetrievalRerank:
         )
         store.save_chunks(chunks, ArtifactMeta(schema_version="1.0", chunking_hash="ch"))
         config = AppConfig()
+        config.reranker.query_strategy = "synonyms_rerank"
         phase, reranker = self._phase(
             store,
             config,
@@ -171,6 +172,7 @@ class TestRetrievalRerank:
             ArtifactMeta(schema_version="1.0", chunking_hash="ch"),
         )
         config = AppConfig()
+        config.reranker.query_strategy = "synonyms_rerank"
         config.reranker.top_n = 5
         config.reranker.score_threshold = 0.0
         config.context.early_exit_threshold = 0.0
@@ -362,6 +364,7 @@ class TestRetrievalRerank:
             ArtifactMeta(schema_version="1.0", chunking_hash="ch"),
         )
         config = AppConfig()
+        config.reranker.query_strategy = "synonyms_rerank"
         phase, reranker = self._phase(
             store,
             config,
@@ -538,6 +541,51 @@ class TestRetrievalRerank:
         ]
         assert bundle.candidates[0].rerank_score == pytest.approx(2.0)
         assert bundle.candidates[1].rerank_score == pytest.approx(1.0)
+
+    def test_t_rnk_12_category_default_two_pairs(self) -> None:
+        """Умолчание category: два синонима × два чанка — две пары по category."""
+        store = InMemoryArtifactStore()
+        store.save_chunks(
+            ChunkBatch(
+                doc_id="doc",
+                chunks=[
+                    ChunkRecord(chunk_id="c0", text="t0", chunk_index=0),
+                    ChunkRecord(chunk_id="c1", text="t1", chunk_index=1),
+                ],
+            ),
+            ArtifactMeta(schema_version="1.0", chunking_hash="ch"),
+        )
+        config = AppConfig()
+        assert config.reranker.query_strategy == "category"
+        default_hash = config.reranker_config_hash
+        phase, reranker = self._phase(
+            store,
+            config,
+            retriever=self._fixed_retriever(
+                [
+                    self._candidate("Q1", "c0", "t0", rank=1),
+                    self._candidate("Q1", "c1", "t1", rank=2),
+                ]
+            ),
+        )
+        reranker.load()
+        context = self._context(
+            config,
+            questions=[Question(id="Q1", category="cat", synonyms=["syn"])],
+        )
+        phase.execute(self._compute_plan("doc"), context)
+        assert len(reranker.infer_calls) == 1
+        pairs = reranker.infer_calls[0].pairs
+        assert [pair.pair_id for pair in pairs] == ["c0#0", "c1#0"]
+        assert all(pair.query == "cat" for pair in pairs)
+        other = AppConfig()
+        other.reranker.query_strategy = "synonyms_rerank"
+        assert other.reranker_config_hash != default_hash
+
+    def test_t_rnk_13_unknown_query_strategy(self) -> None:
+        """Чужой reranker.query_strategy — ValueError при разборе конфига."""
+        with pytest.raises(ValueError, match="query_strategy"):
+            RerankerConfig(query_strategy="mean")
 
     def _phase(
         self,

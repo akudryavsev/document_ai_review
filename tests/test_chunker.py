@@ -10,7 +10,7 @@ from models.documents import CleanedDocument, ExtractedBlock
 
 
 class TestChunker:
-    """Каталог T-CHK-01…15."""
+    """Каталог T-CHK-01…17."""
 
     def test_t_chk_01_sections_do_not_mix(self) -> None:
         """Два коротких раздела не попадают в один чанк, путь — свой."""
@@ -271,6 +271,52 @@ class TestChunker:
         assert len(batch.chunks) == 1
         assert batch.chunks[0].text == word
         assert WhitespaceTokenCounter().count(batch.chunks[0].text) == 1
+
+    def test_t_chk_16_long_block_is_sliced_not_crept(self) -> None:
+        """Блок длиннее лимита режется окнами, хвост забирает следующий короткий блок."""
+        body = " ".join(f"w{index}" for index in range(1, 26))
+        document = self._document(
+            [
+                ExtractedBlock(
+                    kind="paragraph",
+                    text="предисловие короткое",
+                    section_path=["Раздел"],
+                ),
+                ExtractedBlock(
+                    kind="paragraph",
+                    text=body,
+                    section_path=["Раздел"],
+                ),
+                ExtractedBlock(
+                    kind="paragraph",
+                    text="хвост абзаца",
+                    section_path=["Раздел"],
+                ),
+            ]
+        )
+        batch = self._chunker(max_tokens=10, overlap_tokens=2, min_chunk_tokens=0).chunk(
+            document
+        )
+        texts = [chunk.text.split() for chunk in batch.chunks]
+        assert texts == [
+            "предисловие короткое w1 w2 w3 w4 w5 w6 w7 w8".split(),
+            "w7 w8 w9 w10 w11 w12 w13 w14 w15 w16".split(),
+            "w15 w16 w17 w18 w19 w20 w21 w22 w23 w24".split(),
+            "w23 w24 w25 хвост абзаца".split(),
+        ]
+
+    def test_t_chk_17_sentence_that_fits_is_not_split(self) -> None:
+        """Предложение короче лимита не разрезается, если не входит в остаток окна."""
+        document = self._document(
+            [ExtractedBlock(kind="paragraph", text="a1 a2 a3 a4 a5. b1 b2 b3 b4.")]
+        )
+        batch = self._chunker(max_tokens=8, overlap_tokens=2, min_chunk_tokens=0).chunk(
+            document
+        )
+        assert [chunk.text.split() for chunk in batch.chunks] == [
+            "a1 a2 a3 a4 a5.".split(),
+            "a4 a5. b1 b2 b3 b4.".split(),
+        ]
 
     def test_preserve_section_path_false(self) -> None:
         """При preserve_section_path=false у чанков путь None."""

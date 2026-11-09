@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from chunking.debug_dump import ChunkDebugDump
 from extract.debug_dump import BlockDocumentDebugDump
 from models.artifacts import ArtifactMeta
-from models.documents import CleanedDocument, ExtractedDocument
+from models.documents import ChunkBatch, CleanedDocument, ExtractedDocument
 from models.gateways import EmbedItem, EmbedRequest
 from store.codec import ArtifactCodec
 from models.phases import (
@@ -32,6 +33,7 @@ class IndexingPhase(Phase):
     только когда хотя бы один текст не найден в embed_cache.
 
     Attributes:
+        trace_stage: Имя фазы в событии отказа документа.
         extractor: Extractor.
         cleaner: Cleaner.
         chunker: Chunker.
@@ -40,7 +42,10 @@ class IndexingPhase(Phase):
         gate: ArtifactGate.
         lease: GpuLease.
         trace_sink: TraceSink.
+        chunk_dump: Дамп чанков. Пишет файл только при enabled.
     """
+
+    trace_stage = "A1"
 
     def __init__(
         self,
@@ -52,6 +57,7 @@ class IndexingPhase(Phase):
         gate: ArtifactGate,
         lease: GpuLease,
         trace_sink: TraceSink,
+        chunk_dump: ChunkDebugDump | None = None,
     ) -> None:
         """Сохраняет порты фазы.
 
@@ -64,6 +70,7 @@ class IndexingPhase(Phase):
             gate: Решение reuse.
             lease: Аренда GPU.
             trace_sink: Наблюдаемость.
+            chunk_dump: Дамп chunks.md или None.
         """
         self.extractor = extractor
         self.cleaner = cleaner
@@ -73,6 +80,7 @@ class IndexingPhase(Phase):
         self.gate = gate
         self.lease = lease
         self.trace_sink = trace_sink
+        self.chunk_dump = chunk_dump
 
     def plan(self, context: PhaseContext) -> PhasePlan:
         """Решает compute/skip по meta чанков.
@@ -134,29 +142,19 @@ class IndexingPhase(Phase):
                 self._dump_debug(context, extracted, "extract")
                 if extracted.failure_reason or not extracted.has_text_layer:
                     failed += 1
-                    outcomes.append(
-                        DocumentPhaseOutcome(
-                            doc_id=doc_id,
-                            status="failed",
-                            reason=extracted.failure_reason or "no_text_layer",
-                        )
-                    )
+                    reason = extracted.failure_reason or "no_text_layer"
+                    outcomes.append(self.fail_document(doc_id, reason))
                     continue
                 cleaned = self.cleaner.clean(extracted)
                 self._dump_debug(context, cleaned, "clean")
                 batch = self.chunker.chunk(cleaned)
                 batch.chunking_hash = context.config.chunking_hash
                 batch.embedding_model = context.config.embedding.model
+                self._dump_chunks(batch)
                 if not batch.chunks:
                     failed += 1
                     zero_chunk_docs.append(doc_id)
-                    outcomes.append(
-                        DocumentPhaseOutcome(
-                            doc_id=doc_id,
-                            status="failed",
-                            reason="zero_chunks",
-                        )
-                    )
+                    outcomes.append(self.fail_document(doc_id, "zero_chunks"))
                     continue
                 ordered = sorted(batch.chunks, key=lambda chunk: chunk.chunk_index)
                 rows, dim, payload = self._embed_labeled(
@@ -179,13 +177,7 @@ class IndexingPhase(Phase):
                 )
             except Exception as error:  # noqa: BLE001 — устойчивость прогона
                 failed += 1
-                outcomes.append(
-                    DocumentPhaseOutcome(
-                        doc_id=doc_id,
-                        status="failed",
-                        reason=str(error),
-                    )
-                )
+                outcomes.append(self.fail_document(doc_id, str(error)))
         report = PhaseReport(
             phase="A1",
             computed=computed,
@@ -204,20 +196,31 @@ class IndexingPhase(Phase):
         document: ExtractedDocument | CleanedDocument,
         stage: str,
     ) -> None:
-        """Пишет отладочный Markdown, если extraction.debug_dump включён.
+        """Пишет extract или clean, если включён флаг или уровень DEBUG.
 
         Args:
             context: Контекст фазы с конфигом.
             document: Документ после extract или clean.
             stage: extract или clean.
         """
-        if not context.config.extraction.debug_dump:
+        debug_level = context.config.runtime.log_level == "DEBUG"
+        if not context.config.extraction.debug_dump and not debug_level:
             return
         dump = BlockDocumentDebugDump(
             enabled=True,
             cache_dir=context.config.runtime.cache_dir,
         )
         dump.write(document, stage)
+
+    def _dump_chunks(self, batch: ChunkBatch) -> None:
+        """Пишет chunks.md, если дамп включён.
+
+        Args:
+            batch: Пакет после нарезки, в том числе пустой.
+        """
+        if self.chunk_dump is None:
+            return
+        self.chunk_dump.write(batch.doc_id, batch.chunks)
 
     def _embed_questions(self, context: PhaseContext) -> None:
         """Эмбеддит category и synonyms вопросов и кэширует.
