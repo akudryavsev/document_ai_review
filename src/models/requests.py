@@ -61,12 +61,15 @@ class RunRequest(BaseModel):
         overrides = self.overrides
         if overrides.answer_model is not None:
             config.answer.model = overrides.answer_model
+            config.answer.models = [overrides.answer_model]
         if overrides.reranker_model is not None:
             config.reranker.model = overrides.reranker_model
+            config.reranker.models = [overrides.reranker_model]
         if overrides.embedding_model is not None:
             config.embedding.model = overrides.embedding_model
+            config.embedding.models = [overrides.embedding_model]
         if overrides.cache_dir is not None:
-            config.embedding.cache_dir = overrides.cache_dir
+            config.runtime.cache_dir = overrides.cache_dir
         if overrides.contexts_dir is not None:
             config.phases.contexts_dir = overrides.contexts_dir
         if overrides.results_dir is not None:

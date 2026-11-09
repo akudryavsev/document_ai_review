@@ -144,6 +144,22 @@ class AnswerGenerator(AnswerGeneratorPort):
         self.answer_config = answer_config
         self.runtime_config = runtime_config
         self.llm = llm
+        self.embedding_model = ""
+        self.reranker_model = ""
+
+    def _combination(self) -> dict[str, str]:
+        """Имена файлов текущей тройки для строки ответа.
+
+        Returns:
+            Поля model, embedding_model, reranker_model и answer_model.
+        """
+        answer_name = self.answer_config.model or ""
+        return {
+            "model": answer_name,
+            "embedding_model": self.embedding_model,
+            "reranker_model": self.reranker_model,
+            "answer_model": answer_name,
+        }
 
     def generate(
         self,
@@ -375,7 +391,7 @@ class AnswerGenerator(AnswerGeneratorPort):
             confidence=None,
             retrieval=self._retrieval(bundle),
             tokens=usage,
-            model=self.answer_config.model,
+            **self._combination(),
             latency_ms=latency_ms,
             status="ok",
             verification_skipped=False,
@@ -415,7 +431,7 @@ class AnswerGenerator(AnswerGeneratorPort):
             confidence=None,
             retrieval=self._retrieval(bundle),
             tokens=usage,
-            model=self.answer_config.model,
+            **self._combination(),
             latency_ms=latency_ms,
             status="ok",
             verification_skipped=False,
@@ -455,7 +471,7 @@ class AnswerGenerator(AnswerGeneratorPort):
             confidence=None,
             retrieval=self._retrieval(bundle),
             tokens=usage,
-            model=self.answer_config.model,
+            **self._combination(),
             latency_ms=latency_ms,
             status="failed",
             verification_skipped=False,

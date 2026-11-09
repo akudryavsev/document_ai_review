@@ -29,15 +29,61 @@ class FileResultSink(ResultSink):
         self.answers: list[AnswerRecord] = []
 
     def write_answer(self, record: AnswerRecord) -> None:
-        """Дописывает строку в results/<doc_id>.jsonl.
+        """Заменяет строку того же документа, вопроса и тройки.
 
         Args:
             record: AnswerRecord.
         """
+        self.answers = [
+            item
+            for item in self.answers
+            if not self._same_triple(item, record)
+        ]
         self.answers.append(record)
         path = self.results_dir / f"{record.doc_id}.jsonl"
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(record.model_dump_json() + "\n")
+        kept = self._kept_lines(path, record)
+        kept.append(record.model_dump_json())
+        path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    def _kept_lines(self, path: Path, record: AnswerRecord) -> list[str]:
+        """Оставляет строки файла, кроме той же тройки и вопроса.
+
+        Args:
+            path: Файл jsonl документа.
+            record: Новая запись.
+
+        Returns:
+            Строки, которые остаются в файле.
+        """
+        if not path.is_file():
+            return []
+        kept: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            existing = AnswerRecord.model_validate_json(line)
+            if self._same_triple(existing, record):
+                continue
+            kept.append(line)
+        return kept
+
+    def _same_triple(self, left: AnswerRecord, right: AnswerRecord) -> bool:
+        """Сравнивает документ, вопрос и тройку моделей.
+
+        Args:
+            left: Уже записанная строка.
+            right: Новая строка.
+
+        Returns:
+            True, если это та же пара и та же тройка.
+        """
+        return (
+            left.doc_id == right.doc_id
+            and left.question_id == right.question_id
+            and left.embedding_model == right.embedding_model
+            and left.reranker_model == right.reranker_model
+            and left.answer_model == right.answer_model
+        )
 
     def write_summary(self, summary: object) -> None:
         """Пишет run_summary.json.

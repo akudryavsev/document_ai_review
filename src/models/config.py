@@ -9,6 +9,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+from models.model_list import ModelListResolver
+
 
 class InputConfig(BaseModel):
     """Пути к входным документам и вопросам.
@@ -54,7 +56,8 @@ class EmbeddingConfig(BaseModel):
     """Параметры эмбеддера.
 
     Attributes:
-        model: Идентификатор модели.
+        model: Имя файла текущей комбинации. Первый элемент models.
+        models: Имена GGUF в каталоге models/. Одно имя — список из одного.
         batch_size: Размер батча.
         dtype: Тип данных на устройстве.
         device: Устройство загрузки.
@@ -64,7 +67,8 @@ class EmbeddingConfig(BaseModel):
         persist_bm25: Сохранять BM25-индекс на диск.
     """
 
-    model: str = "embed"
+    model: str | None = Field(default=None, exclude=True)
+    models: list[str] | None = None
     batch_size: int = 8
     dtype: str = "fp16"
     device: str = "cuda:0"
@@ -72,6 +76,41 @@ class EmbeddingConfig(BaseModel):
     questions_cache: str = "./.cache/questions.parquet"
     persist_chunk_index: bool = True
     persist_bm25: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_both_model_keys(cls, value: object) -> object:
+        """Запрещает в YAML сразу и model, и models.
+
+        Args:
+            value: Сырой словарь секции или уже собранный конфиг.
+
+        Returns:
+            Тот же вход.
+
+        Raises:
+            ValueError: В словаре заданы оба ключа.
+        """
+        if isinstance(value, dict) and value.get("model") is not None and value.get("models") is not None:
+            raise ValueError("одновременно заданы model и models")
+        return value
+
+    @model_validator(mode="after")
+    def resolve_models(self) -> EmbeddingConfig:
+        """Сводит model и models к списку имён файлов.
+
+        Returns:
+            Конфиг с заполненными model и models.
+
+        Raises:
+            ValueError: Список пуст.
+        """
+        if self.models and self.model == self.models[0]:
+            return self
+        current, names = ModelListResolver("embed").resolve(self.model, self.models)
+        self.model = current
+        self.models = names
+        return self
 
 
 class HybridConfig(BaseModel):
@@ -113,17 +152,54 @@ class RerankerConfig(BaseModel):
 
     Attributes:
         enabled: Включён ли реранкер.
-        model: Идентификатор модели.
+        model: Имя файла текущей комбинации. Первый элемент models.
+        models: Имена GGUF реранкеров.
         top_n: Число кандидатов после реранка.
         score_threshold: Порог реранка; 0 выключает отсечение.
         device: Устройство загрузки.
     """
 
     enabled: bool = True
-    model: str = "rerank"
+    model: str | None = Field(default=None, exclude=True)
+    models: list[str] | None = None
     top_n: int = 5
     score_threshold: float = 0.0
     device: str = "cuda:0"
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_both_model_keys(cls, value: object) -> object:
+        """Запрещает в YAML сразу и model, и models.
+
+        Args:
+            value: Сырой словарь секции или уже собранный конфиг.
+
+        Returns:
+            Тот же вход.
+
+        Raises:
+            ValueError: В словаре заданы оба ключа.
+        """
+        if isinstance(value, dict) and value.get("model") is not None and value.get("models") is not None:
+            raise ValueError("одновременно заданы model и models")
+        return value
+
+    @model_validator(mode="after")
+    def resolve_models(self) -> RerankerConfig:
+        """Сводит model и models к списку имён файлов.
+
+        Returns:
+            Конфиг с заполненными model и models.
+
+        Raises:
+            ValueError: Список пуст.
+        """
+        if self.models and self.model == self.models[0]:
+            return self
+        current, names = ModelListResolver("rerank").resolve(self.model, self.models)
+        self.model = current
+        self.models = names
+        return self
 
 
 class VerificationConfig(BaseModel):
@@ -166,18 +242,55 @@ class AnswerConfig(BaseModel):
     """Параметры генерации ответа.
 
     Attributes:
-        model: Идентификатор LLM.
+        model: Имя файла текущей комбинации. Первый элемент models.
+        models: Имена GGUF моделей ответа.
         device: Устройство загрузки.
         temperature: Температура генерации.
         max_output_tokens: Лимит токенов ответа.
         require_citations: Требовать цитаты в ответе.
     """
 
-    model: str = "answer"
+    model: str | None = Field(default=None, exclude=True)
+    models: list[str] | None = None
     device: str = "auto"
     temperature: float = 0
     max_output_tokens: int = 800
     require_citations: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_both_model_keys(cls, value: object) -> object:
+        """Запрещает в YAML сразу и model, и models.
+
+        Args:
+            value: Сырой словарь секции или уже собранный конфиг.
+
+        Returns:
+            Тот же вход.
+
+        Raises:
+            ValueError: В словаре заданы оба ключа.
+        """
+        if isinstance(value, dict) and value.get("model") is not None and value.get("models") is not None:
+            raise ValueError("одновременно заданы model и models")
+        return value
+
+    @model_validator(mode="after")
+    def resolve_models(self) -> AnswerConfig:
+        """Сводит model и models к списку имён файлов.
+
+        Returns:
+            Конфиг с заполненными model и models.
+
+        Raises:
+            ValueError: Список пуст.
+        """
+        if self.models and self.model == self.models[0]:
+            return self
+        current, names = ModelListResolver("answer").resolve(self.model, self.models)
+        self.model = current
+        self.models = names
+        return self
 
 
 class PhasesConfig(BaseModel):

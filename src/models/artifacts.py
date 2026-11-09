@@ -144,7 +144,10 @@ class AnswerRecord(BaseModel):
         reason: Причина found=false или None.
         retrieval: Статистика поиска.
         tokens: Учёт токенов.
-        model: Идентификатор модели.
+        model: Имя файла модели ответа. Совпадает с answer_model.
+        embedding_model: Имя файла эмбеддера комбинации.
+        reranker_model: Имя файла реранкера комбинации.
+        answer_model: Имя файла модели ответа комбинации.
         latency_ms: Задержка ответа.
         status: Статус пары.
         verification_skipped: Верификация была пропущена.
@@ -164,6 +167,9 @@ class AnswerRecord(BaseModel):
     retrieval: RetrievalStats = Field(default_factory=RetrievalStats)
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     model: str = ""
+    embedding_model: str = ""
+    reranker_model: str = ""
+    answer_model: str = ""
     latency_ms: float = 0.0
     status: Literal["ok", "failed"] = "ok"
     verification_skipped: bool = False

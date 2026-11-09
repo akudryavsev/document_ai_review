@@ -86,6 +86,89 @@ class CheckingArtifactStore(ArtifactStore):
         """
         self.codec = ArtifactCodec()
         self.trace = ArtifactTrace(trace_sink)
+        self._embedding_model: str | None = None
+        self._reranker_model: str | None = None
+        self._answer_model: str | None = None
+
+    def bind_models(
+        self,
+        embedding_model: str,
+        reranker_model: str,
+        answer_model: str,
+    ) -> None:
+        """Включает префиксы каталогов для текущей тройки моделей.
+
+        Args:
+            embedding_model: Имя файла эмбеддера.
+            reranker_model: Имя файла реранкера.
+            answer_model: Имя файла модели ответа.
+        """
+        self._embedding_model = self._model_segment(embedding_model)
+        self._reranker_model = self._model_segment(reranker_model)
+        self._answer_model = self._model_segment(answer_model)
+
+    def _model_segment(self, name: str) -> str:
+        """Проверяет, что имя модели — один сегмент пути.
+
+        Args:
+            name: Имя файла модели.
+
+        Returns:
+            То же имя.
+
+        Raises:
+            ValueError: В имени есть разделитель или имя пустое.
+        """
+        if name == "" or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ValueError("небезопасное имя модели")
+        return name
+
+    def _emb_root(self, doc_id: str) -> str:
+        """Каталог чанков документа с префиксом эмбеддера, если он задан.
+
+        Args:
+            doc_id: Безопасный идентификатор документа.
+
+        Returns:
+            Логический каталог без завершающего слэша.
+        """
+        if self._embedding_model is None:
+            return f"cache/emb/{doc_id}"
+        return f"cache/emb/{self._embedding_model}/{doc_id}"
+
+    def _pair_root(self, kind: str, doc_id: str) -> str:
+        """Каталог кандидатов или контекстов.
+
+        Args:
+            kind: index или contexts.
+            doc_id: Безопасный идентификатор документа.
+
+        Returns:
+            Логический каталог без завершающего слэша.
+        """
+        if self._embedding_model is None or self._reranker_model is None:
+            return f"{kind}/{doc_id}"
+        return f"{kind}/{self._embedding_model}/{self._reranker_model}/{doc_id}"
+
+    def _answers_root(self, doc_id: str) -> str:
+        """Каталог meta ответов.
+
+        Args:
+            doc_id: Безопасный идентификатор документа.
+
+        Returns:
+            Логический каталог без завершающего слэша.
+        """
+        if (
+            self._embedding_model is None
+            or self._reranker_model is None
+            or self._answer_model is None
+        ):
+            return f"cache/answers/{doc_id}"
+        return (
+            f"cache/answers/{self._embedding_model}/"
+            f"{self._reranker_model}/{self._answer_model}/{doc_id}"
+        )
 
     @abstractmethod
     def _read(self, key: str) -> bytes | None:
@@ -777,7 +860,7 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"cache/emb/{doc_id}/chunks.jsonl"
+        return f"{self._emb_root(doc_id)}/chunks.jsonl"
 
     def _chunks_meta_key(self, doc_id: str) -> str:
         """Ключ meta.json чанков.
@@ -788,7 +871,7 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"cache/emb/{doc_id}/meta.json"
+        return f"{self._emb_root(doc_id)}/meta.json"
 
     def _vectors_key(self, doc_id: str) -> str:
         """Ключ vectors.f16.
@@ -799,7 +882,7 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"cache/emb/{doc_id}/vectors.f16"
+        return f"{self._emb_root(doc_id)}/vectors.f16"
 
     def _vectors_index_key(self, doc_id: str) -> str:
         """Ключ vectors.index.jsonl.
@@ -810,7 +893,7 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"cache/emb/{doc_id}/vectors.index.jsonl"
+        return f"{self._emb_root(doc_id)}/vectors.index.jsonl"
 
     def _candidates_key(self, doc_id: str) -> str:
         """Ключ candidates.jsonl.
@@ -821,7 +904,7 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"index/{doc_id}/candidates.jsonl"
+        return f"{self._pair_root('index', doc_id)}/candidates.jsonl"
 
     def _candidates_meta_key(self, doc_id: str) -> str:
         """Ключ meta кандидатов.
@@ -832,7 +915,7 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"index/{doc_id}/meta.json"
+        return f"{self._pair_root('index', doc_id)}/meta.json"
 
     def _context_key(self, doc_id: str, question_id: str) -> str:
         """Ключ JSON бандла.
@@ -844,7 +927,7 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"contexts/{doc_id}/{question_id}.json"
+        return f"{self._pair_root('contexts', doc_id)}/{question_id}.json"
 
     def _questions_key(self) -> str:
         """Ключ questions.jsonl.
@@ -852,7 +935,9 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return "cache/questions.jsonl"
+        if self._embedding_model is None:
+            return "cache/questions.jsonl"
+        return f"cache/questions/{self._embedding_model}/questions.jsonl"
 
     def _questions_meta_key(self) -> str:
         """Ключ questions.meta.json.
@@ -860,7 +945,9 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return "cache/questions.meta.json"
+        if self._embedding_model is None:
+            return "cache/questions.meta.json"
+        return f"cache/questions/{self._embedding_model}/questions.meta.json"
 
     def _question_vectors_key(self) -> str:
         """Ключ questions.f16.
@@ -868,7 +955,9 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return "cache/questions.f16"
+        if self._embedding_model is None:
+            return "cache/questions.f16"
+        return f"cache/questions/{self._embedding_model}/questions.f16"
 
     def _question_index_key(self) -> str:
         """Ключ questions.index.jsonl.
@@ -876,7 +965,9 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return "cache/questions.index.jsonl"
+        if self._embedding_model is None:
+            return "cache/questions.index.jsonl"
+        return f"cache/questions/{self._embedding_model}/questions.index.jsonl"
 
     def _embed_vector_key(self, key: str) -> str:
         """Ключ файла вектора в embed_cache.
@@ -909,4 +1000,4 @@ class CheckingArtifactStore(ArtifactStore):
         Returns:
             Логический ключ.
         """
-        return f"cache/answers/{doc_id}/meta.json"
+        return f"{self._answers_root(doc_id)}/meta.json"

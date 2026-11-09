@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from pathlib import Path
+
+from pydantic import ValidationError
 
 from application import Application
+from gateways.models_ini import LlamaModelsIni, ModelCatalog, ModelIniError, ModelListError
 from models.config import AppConfig
 from models.requests import EvalRequest, PhaseName, RunOverrides, RunRequest
+from runs.evaluation import EvaluationError
 
 
 class CliApp:
@@ -35,6 +41,8 @@ class CliApp:
             return self._run(namespace)
         if namespace.command == "eval":
             return self._eval(namespace)
+        if namespace.command == "write-models-ini":
+            return self._write_models_ini(namespace)
         parser.print_help()
         return 2
 
@@ -68,6 +76,12 @@ class CliApp:
         eval_parser.add_argument("--config", required=True)
         eval_parser.add_argument("--ground-truth", required=True)
         eval_parser.add_argument("--predictions", required=True)
+
+        ini_parser = subparsers.add_parser(
+            "write-models-ini",
+            help="Перезаписать deploy/llama/models.ini по спискам конфига",
+        )
+        ini_parser.add_argument("--config", required=True)
         return parser
 
     def _run(self, namespace: argparse.Namespace) -> int:
@@ -79,7 +93,11 @@ class CliApp:
         Returns:
             Код выхода.
         """
-        config = AppConfig.from_yaml(namespace.config)
+        try:
+            config = AppConfig.from_yaml(namespace.config)
+        except ValidationError as error:
+            print(str(error), file=sys.stderr)
+            return 1
         phases = self._parse_phases(namespace.phase)
         force_phases = {
             self._parse_single_phase(item) for item in namespace.force_phases
@@ -100,6 +118,8 @@ class CliApp:
             ),
         )
         resolved = request.resolved_config()
+        if not self._accept_models(resolved, check_ini=True):
+            return 1
         service = Application(resolved).build()
         summary = service.run(request)
         print(
@@ -117,7 +137,11 @@ class CliApp:
         Returns:
             Код выхода.
         """
-        config = AppConfig.from_yaml(namespace.config)
+        try:
+            config = AppConfig.from_yaml(namespace.config)
+        except ValidationError as error:
+            print(str(error), file=sys.stderr)
+            return 1
         request = EvalRequest(
             config=config,
             config_path=namespace.config,
@@ -126,11 +150,54 @@ class CliApp:
         )
         service = Application(config).build()
         try:
-            service.evaluate(request)
-        except NotImplementedError as error:
+            reports = service.evaluate(request)
+        except EvaluationError as error:
             print(str(error), file=sys.stderr)
             return 1
+        payload = [report.model_dump() for report in reports]
+        print(json.dumps(payload, ensure_ascii=False))
         return 0
+
+    def _write_models_ini(self, namespace: argparse.Namespace) -> int:
+        """Перезаписывает models.ini каноническим текстом списков.
+
+        Args:
+            namespace: Разобранные аргументы.
+
+        Returns:
+            Код выхода. При ошибке списка файл не меняется.
+        """
+        try:
+            config = AppConfig.from_yaml(namespace.config)
+        except ValidationError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        if not self._accept_models(config, check_ini=False):
+            return 1
+        LlamaModelsIni().write(config, Path("deploy/llama/models.ini"))
+        return 0
+
+    def _accept_models(self, config: AppConfig, check_ini: bool) -> bool:
+        """Проверяет файлы моделей и, для run, совпадение ini.
+
+        Args:
+            config: Конфиг после подмены флагов CLI.
+            check_ini: Сравнивать deploy/llama/models.ini.
+
+        Returns:
+            True, если проверки прошли.
+        """
+        try:
+            ModelCatalog(Path("models")).check(config)
+            if check_ini:
+                LlamaModelsIni().ensure_matches(
+                    config,
+                    Path("deploy/llama/models.ini"),
+                )
+        except (ModelListError, ModelIniError) as error:
+            print(str(error), file=sys.stderr)
+            return False
+        return True
 
     def _parse_phases(self, raw: str) -> list[PhaseName]:
         """Разбирает список фаз из --phase.

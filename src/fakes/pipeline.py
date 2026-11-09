@@ -337,6 +337,22 @@ class FakeAnswerGenerator(AnswerGenerator):
         self.retries = retries
         self.calls: list[dict[str, object]] = []
         self.verify_skipped_pairs: set[tuple[str, str]] = set()
+        self.embedding_model = ""
+        self.reranker_model = ""
+        self.answer_model = ""
+
+    def _names(self) -> dict[str, str]:
+        """Имена тройки, которые AnalysisRun выставляет перед фазой B.
+
+        Returns:
+            Поля строки ответа.
+        """
+        return {
+            "embedding_model": self.embedding_model,
+            "reranker_model": self.reranker_model,
+            "answer_model": self.answer_model,
+            "model": self.answer_model,
+        }
 
     def generate(
         self,
@@ -382,6 +398,7 @@ class FakeAnswerGenerator(AnswerGenerator):
                     except Exception:  # noqa: BLE001 — ожидаемые отказы retry
                         continue
             return AnswerRecord(
+                **self._names(),
                 doc_id=bundle.doc_id,
                 question_id=question.id,
                 category=question.category,
@@ -406,6 +423,7 @@ class FakeAnswerGenerator(AnswerGenerator):
                         )
                     )
                     return AnswerRecord(
+                        **self._names(),
                         doc_id=bundle.doc_id,
                         question_id=question.id,
                         category=question.category,
@@ -429,6 +447,7 @@ class FakeAnswerGenerator(AnswerGenerator):
                 except Exception as error:  # noqa: BLE001 — подделка retry
                     last_error = error
             return AnswerRecord(
+                **self._names(),
                 doc_id=bundle.doc_id,
                 question_id=question.id,
                 category=question.category,
@@ -439,6 +458,7 @@ class FakeAnswerGenerator(AnswerGenerator):
                 status="failed",
             )
         return AnswerRecord(
+            **self._names(),
             doc_id=bundle.doc_id,
             question_id=question.id,
             category=question.category,
@@ -503,11 +523,22 @@ class RecordingResultSink(ResultSink):
         self.summaries: list[RunSummary] = []
 
     def write_answer(self, record: AnswerRecord) -> None:
-        """Сохраняет ответ.
+        """Заменяет строку той же тройки и вопроса.
 
         Args:
             record: AnswerRecord.
         """
+        self.answers = [
+            item
+            for item in self.answers
+            if not (
+                item.doc_id == record.doc_id
+                and item.question_id == record.question_id
+                and item.embedding_model == record.embedding_model
+                and item.reranker_model == record.reranker_model
+                and item.answer_model == record.answer_model
+            )
+        ]
         self.answers.append(record)
 
     def write_summary(self, summary: object) -> None:

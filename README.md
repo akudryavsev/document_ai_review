@@ -1,100 +1,146 @@
 # document_ai_review
 
-Локальный разбор документов по фазам A1 → A2 → B. Извлечение DOCX/PDF, очистка, чанкинг, гибридный поиск, сборка контекста и ответ без верификатора реализованы. Артефакты — JSONL + `vectors.f16`, без OCR и без parquet.
+Локальные ответы по вашим документам. На сервер кладутся DOCX и PDF с текстовым слоем, список вопросов и три файла моделей. Веса считает видеокарта в отдельном контейнере, наружу запросы не уходят.
 
-Веса считает отдельный контейнер `inference` (`llama-server`, одна GGUF на GPU). Процесс приложения в него ходит по HTTP и сам модели не грузит. `eval` и очередь Redis ещё не реализованы: `python main.py eval` завершается с ошибкой.
+Команды `docker compose` набираются на хосте из корня репозитория. Каталоги `experiments/` и `models/` в git не входят: после копирования репозитория их нужно заполнить самим.
 
-Код лежит в `src`. Импорт совпадает с именем папки (`import phases` читает `src/phases`). Команды `docker compose` набираются на хосте из корня репозитория.
+Краткий маршрут:
 
-## Контейнер приложения
+1. Поставить Docker Engine с Compose v2 и NVIDIA Container Toolkit.
+2. Собрать контейнер приложения.
+3. Положить документы в `experiments/documents/`.
+4. Записать вопросы в `experiments/questions.json` и проверить файл.
+5. Скачать GGUF в `models/` и вписать имена этих файлов в списки `config.yaml`.
+6. Поднять контейнер с моделями и запустить прогон. Ответы лежат в `experiments/results/`.
 
-Образ — Python 3.11. Зависимости: `pydantic`, `pyyaml`, `pytest`, `python-docx`, `pypdf`, `pymorphy3`. Репозиторий монтируется в `/app`, `PYTHONPATH=/app/src`.
+## 1. Поставить Docker и доступ к видеокарте
+
+На хосте нужны Docker Engine и плагин Compose v2: команда называется `docker compose`. Этой версии нужен и сервис с моделью, у него в compose-файле указано `gpus: all`.
+
+Установка Engine: [docs.docker.com/engine/install](https://docs.docker.com/engine/install/). После неё пользователь, от которого вы запускаете команды, входит в группу `docker` (`sudo usermod -aG docker $USER`, затем новый вход в систему).
+
+Драйвер NVIDIA стоит на хосте, не в образе. `nvidia-smi` на хосте должен показать карту до старта контейнеров.
+
+Дальше — NVIDIA Container Toolkit, иначе Docker не отдаст GPU контейнеру с моделью: [install-guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). В конце настройки runtime:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+Проверка:
+
+```bash
+docker compose version
+nvidia-smi
+```
+
+В контейнере одновременно загружена одна модель. На карту должна помещаться самая большая из трёх GGUF при окне контекста 4096.
+
+## 2. Собрать контейнер приложения
+
+Из корня репозитория:
 
 ```bash
 docker compose up -d --build
 docker compose exec app python main.py --help
 ```
 
-Если оболочка уже открыта в контейнере (Dev Containers: Reopen in Container), Docker не нужен:
+Образ приложения — Python 3.11. Репозиторий смонтирован в `/app`. Клиента Hugging Face в этом образе нет: модели качаются на хосте.
 
-```bash
-python main.py --help
-```
+Если оболочка уже открыта внутри контейнера `app` (Dev Containers), приставку `docker compose exec app` к командам `python` не добавляйте. Контейнер `inference` всё равно поднимается с хоста.
 
-## CLI
-
-В корне лежит пример `config.yaml`: пути прогона в `./experiments/` (в git не входит), `extraction.debug_dump=true`. Разбор только на чанки — это команда с `--phase A1`, а не флаги `phases.run_*` в YAML.
-
-- `experiments/documents/` — `.docx` / `.pdf`
-- `experiments/debug/` — дампы extract/clean
-- `experiments/emb/<doc_id>/chunks.jsonl` — чанки A1
-- `experiments/results/` — сводка и ответы
-- `experiments/index/`, `experiments/contexts/` — артефакты A2
-- `experiments/questions.json` — для прогонов с A2/B
-
-Список фаз задаёт `--phase`. Без флага это `A1,A2,B`. Поля `phases.run_a1` / `run_a2` / `run_b` в YAML на этот список не влияют.
-
-`--embedding-model`, `--reranker-model` и `--answer-model` — имена секций в `deploy/llama/models.ini` (`embed`, `rerank`, `answer`), не идентификаторы Hugging Face. Другое имя допустимо, только если такая секция есть в ini.
+## 3. Положить документы
 
 ```bash
 mkdir -p experiments/documents
-python main.py run --config config.yaml --phase A1
-python main.py run --config config.yaml --phase A1,A2
-python main.py run --config config.yaml
-python main.py run --config config.yaml --phase B --force-phase B --answer-model answer
-python main.py eval --config config.yaml --ground-truth ./gt.json --predictions ./experiments/results
 ```
 
-Для `--phase A1` файл вопросов не читается. Как только в списке фаз есть A2 или B, `questions.json` обязателен и проверяется до старта фаз. Полный прогон и фазы A2/B требуют запущенный контейнер `inference` и три файла GGUF, см. ниже.
+Сюда кладутся файлы `.docx` и `.pdf`. Обход рекурсивный, вложенные папки тоже читаются. Другие расширения пропускаются.
 
-Без подкоманды `main.py` печатает справку и завершается с ненулевым кодом. Команда `eval` пока возвращает ошибку: `EvaluationRun` отложен до реализации спецификации метрик. `Application` извлекает текст реальными `FormatAwareExtractor`, `Cleaner` и `Chunker`, ищет реальным `HybridSearcher`, контекст собирает реальным `ContextAssembler`, ответ пишет реальный `AnswerGenerator`, артефакты пишет в `FileArtifactStore`. Эмбеддер, реранкер и LLM — `LlamaEmbeddingGateway`, `LlamaRerankerGateway` и `LlamaLlmGateway`: они ходят по HTTP в контейнер `inference` (`llama-server`). Фаза A1 пишет `vectors.f16` из байтов float16. Верификатор в граф не входит. Пустой поиск не вызывает LLM: в ответе фраза «В поиске по этому вопросу ничего не найдено.» При `retrieval.debug_dump=true` фаза A2 дополнительно пишет `{cache_dir}/debug/{doc_id}/{question_id}.retrieval.json` и `{cache_dir}/debug/{doc_id}/{question_id}.context.md`. Имена моделей в конфиге — секции `embed`, `rerank`, `answer` из `deploy/llama/models.ini`. PDF без текстового слоя помечается `no_text_layer`; OCR в этой итерации нет.
+Имя файла становится идентификатором документа, поэтому имена во всей папке должны быть уникальны. Ответ по файлу `dogovor.docx` потом будет в `experiments/results/dogovor.docx.jsonl`.
 
-## Тесты
+PDF нужен с текстовым слоем: скан без текста помечается `no_text_layer` и в ответы не идёт. OCR нет.
 
-Каталог `tests/` покрывает раздел 10 спецификации верхних классов и каталоги извлечения, очистки, чанкинга, хранилища, гибридного поиска, сборки контекста, ответа и шлюзов llama-server (`T-EXT`, `T-CLN`, `T-CHK`, `T-STO`, `T-RET`, `T-RNK`, `T-CTX`, `T-GEN`, `T-GW`).
+Пример конфига `config.yaml` уже указывает на `experiments/documents`. Путь менять не обязательно.
 
-Из корня репозитория на хосте:
+## 4. Записать и проверить вопросы
+
+Файл по умолчанию — `experiments/questions.json`. Пока в списке фаз есть поиск или ответ, прогон читает его до старта и останавливается на пустом списке, дубликате `id`, дубликате `category` и невалидном JSON.
+
+В `category` пишите сам вопрос: его получит модель, и по нему будет формулироваться ответ.
+
+В `synonyms` пишите, как этот факт может выглядеть в документе: абзац или две-три фразы в тех словах, в каких пункт встречается в договоре, политике или отчёте. Несколько синонимов — несколько таких заготовок, если в разных файлах одна и та же мысль записана по-разному. Поиск идёт по каждой заготовке отдельно и берёт лучшее совпадение. Модель при этом отвечает на один текст — `category`.
+
+```json
+{
+  "version": "1.0",
+  "questions": [
+    {
+      "id": "Q001",
+      "category": "Какой срок хранения персональных данных?",
+      "synonyms": [
+        "Персональные данные хранятся в течение пяти лет с момента достижения цели обработки, после чего подлежат уничтожению.",
+        "Срок хранения сведений о субъекте — 5 (пять) лет. По истечении срока носители уничтожаются по акту."
+      ],
+      "expected_answerable": true
+    }
+  ]
+}
+```
+
+`id` и `category` уникальны внутри файла. `expected_answerable` прогон для отбора вопросов не использует, поле можно оставить `true`.
+
+Контейнер `app` из шага 2 уже должен быть запущен. Проверка:
 
 ```bash
-docker compose exec app python -m pytest tests
+docker compose exec app python -c "from ports.file_sources import FileQuestionSource; loaded = FileQuestionSource('experiments/questions.json').load(); print('вопросов:', len(loaded.questions))"
 ```
 
-Внутри контейнера:
+Строка `вопросов: N` значит, что схема принята.
 
-```bash
-python -m pytest tests
-```
+## 5. Скачать модели
 
-## Модели llama.cpp
+Нужны файлы GGUF трёх ролей. В одном прогоне их может быть несколько: прогон идёт по очереди, в каждый момент загружена одна модель.
 
-Каталог `models/` на хосте монтируется в контейнер как `/models`. Файлы в git не входят. Приложение путь к GGUF не открывает: его читает только `llama-server` по `deploy/llama/models.ini`.
-
-| Секция ini и поле `model` в `config.yaml` | Файл по умолчанию | Назначение |
+| Роль | Список в `config.yaml` | Что это за модель |
 |---|---|---|
-| `embed` | `/models/embed.gguf` | Эмбеддинги, фаза A1. В секции `embedding = true` |
-| `rerank` | `/models/rerank.gguf` | Реранк, фаза A2. В секции `embedding = true`, `reranking = true`, `pooling = rank` |
-| `answer` | `/models/answer.gguf` | Ответ, фаза B. Чат-модель, флагов эмбеддинга нет |
+| Эмбеддинги, индексация | `embedding.models` | Модель эмбеддингов. В секции ini будет `embedding = true` |
+| Реранк, поиск | `reranker.models` | Модель, которую llama-server считает реранкером. В секции: `embedding = true`, `reranking = true`, `pooling = rank` |
+| Ответ | `answer.models` | Обычная чат-модель. Флагов эмбеддинга в секции нет |
 
-Имя секции менять не нужно. В `config.yaml` остаются `embed`, `rerank`, `answer`. Какой именно GGUF лежит по пути секции, выбирает оператор: одна модель должна помещаться на GPU контейнера. Окно контекста всех пресетов — `ctx-size = 4096` в секции `[*]`.
+Имя в списке — имя файла в `models/`, с суффиксом `.gguf`. Одно и то же имя нельзя поставить дважды и нельзя отдать двум ролям. `python main.py run` до старта фаз проверяет все три списка и останавливается, если какого-то файла нет. Это относится и к `--phase A1`: индексация считает эмбеддинги кусков файлом из `embedding.models`, а файлы реранкера и ответа к этому моменту уже лежат в `models/`, потому что проверка и `models.ini` собираются по всему конфигу.
 
-На хосте для боевого прогона нужны драйвер NVIDIA и NVIDIA Container Toolkit. Образ сервера — `ghcr.io/ggml-org/llama.cpp:server-cuda`, в контейнере одновременно не больше одной модели (`--models-max 1`).
+Пример в репозитории — по одному файлу:
 
-Без профиля стартует только `app`. Профиль `poc` поднимает ещё и `inference`. Из контейнера `app` адрес уже прописан: `http://inference:8080`.
-
-```bash
-docker compose --profile poc up -d
+```yaml
+embedding:
+  models:
+    - embed.gguf
+reranker:
+  models:
+    - rerank.gguf
+answer:
+  models:
+    - answer.gguf
 ```
 
-Замена байтов GGUF при том же имени секции сама по себе фазу не пересчитывает. После смены файла эмбеддера нужен `--force-phase A1`, после смены реранкера — `--force-phase A2`, после смены модели ответа — `--force-phase B`.
+Несколько моделей — несколько строк в списке. Прогон перебирает эмбеддеры, для каждого — реранкеры, для каждой пары — модели ответа. В строке ответа остаются имена этой тройки: `embedding_model`, `reranker_model`, `answer_model`.
 
-### Скачать GGUF
-
-Качать на хосте, в каталог `models/`. В образе `app` клиента Hugging Face нет. Ниже `huggingface-cli` из пакета `huggingface_hub` (`pip install -U huggingface_hub` на хосте). Репозиторий и имя файла — те, которые вы кладёте на эту машину; проект конкретную карточку не фиксирует.
-
-Скачать один файл и сразу положить под именем, которое уже ждёт ini:
+Проект конкретный репозиторий на Hugging Face не фиксирует. Качается на хосте, пакет `huggingface_hub`:
 
 ```bash
+pip install -U huggingface_hub
 mkdir -p models
+```
+
+Если команда `huggingface-cli` не находится, тот же вызов делает `hf download`.
+
+### Имена из примера
+
+`config.yaml` и `deploy/llama/models.ini` уже согласованы на `embed.gguf`, `rerank.gguf` и `answer.gguf`. Каталог `/models` внутри контейнера — это `models/` на хосте.
+
+```bash
 huggingface-cli download ORG/EMBED-GGUF embed-file.gguf --local-dir /tmp/gguf
 cp /tmp/gguf/embed-file.gguf models/embed.gguf
 
@@ -105,29 +151,107 @@ huggingface-cli download ORG/ANSWER-GGUF answer-file.gguf --local-dir /tmp/gguf
 cp /tmp/gguf/answer-file.gguf models/answer.gguf
 ```
 
-Так ini править не надо. На место `embed` годится только GGUF эмбеддера, на `rerank` — модель, которую llama-server умеет скорить как reranker, на `answer` — чат.
+### Оставить понятные имена
 
-### Уже скачанные файлы
-
-Два равноправных способа.
-
-Оставить ini как есть и назвать файлы так, как в нём написано. Путь в ini — путь внутри контейнера, поэтому на хосте это каталог `models/`:
+Файл кладётся в `models/` под своим именем, и это имя пишется в список роли:
 
 ```bash
-cp /path/to/already/my-embed.gguf models/embed.gguf
-cp /path/to/already/my-reranker.gguf models/rerank.gguf
-cp /path/to/already/my-answer.gguf models/answer.gguf
+cp /path/to/bge-m3-q8.gguf models/bge-m3-q8.gguf
+cp /path/to/bge-reranker.gguf models/bge-reranker.gguf
+cp /path/to/qwen-reranker.gguf models/qwen-reranker.gguf
+cp /path/to/Qwen3-8B-Q4_K_M.gguf models/Qwen3-8B-Q4_K_M.gguf
 ```
 
-Либо сохранить исходные имена и поправить только строку `model` в нужной секции `deploy/llama/models.ini`. Секцию не переименовывать и это имя не писать в `config.yaml`.
+```yaml
+embedding:
+  models:
+    - bge-m3-q8.gguf
+reranker:
+  models:
+    - bge-reranker.gguf
+    - qwen-reranker.gguf
+answer:
+  models:
+    - Qwen3-8B-Q4_K_M.gguf
+```
+
+Ini руками не правят. Команда перезаписывает `deploy/llama/models.ini` по спискам: заголовок секции и поле `model` равны имени файла, путь внутри контейнера — `/models/<имя>`.
 
 ```bash
-cp /path/to/already/Qwen3-8B-Q4_K_M.gguf models/Qwen3-8B-Q4_K_M.gguf
+docker compose exec app python main.py write-models-ini --config config.yaml
+docker compose --profile poc up -d inference
 ```
 
-```ini
-[answer]
-model = /models/Qwen3-8B-Q4_K_M.gguf
+`run` сравнивает ini со списками и останавливается, если текст другой. После правки списков снова `write-models-ini` и пересоздание `inference`. Окно контекста задаёт `ctx-size` в секции `[*]`, сейчас `4096`.
+
+## 6. Запустить прогон
+
+Файлы GGUF уже лежат в `models/`. Поднять приложение и сервер моделей:
+
+```bash
+docker compose --profile poc up -d
 ```
 
-То же для `[embed]` и `[rerank]`: слева секция `embed` или `rerank`, справа `/models/` и имя файла, как оно лежит на хосте в `models/`. Флаги `embedding`, `reranking` и `pooling` у этих секций не снимать. После правки ini контейнер `inference` нужно пересоздать, чтобы он перечитал пресет: `docker compose --profile poc up -d inference`.
+Образ сервера — `ghcr.io/ggml-org/llama.cpp:server-cuda`, он скачивается при первом запуске и занимает заметное место. В `docker compose ps` сервис `inference` должен быть запущен. Журнал: `docker compose logs inference`. Из контейнера `app` адрес сервера уже прописан в `config.yaml`: `http://inference:8080`.
+
+Полный прогон — индексация, поиск и ответы:
+
+```bash
+docker compose exec app python main.py run --config config.yaml
+```
+
+Только индексация, с пересчётом уже готовых кусков:
+
+```bash
+docker compose exec app python main.py run --config config.yaml --phase A1 --force-phase A1
+```
+
+Для имён из `config.yaml` до этой команды в `models/` уже лежат `embed.gguf`, `rerank.gguf` и `answer.gguf`. A1 загружает `embed.gguf` и пишет векторы кусков в `experiments/emb/embed.gguf/<имя документа>/`.
+
+Список фаз задаёт `--phase`. Без флага выполняются `A1,A2,B`. Поля `phases.run_a1`, `run_a2` и `run_b` в `config.yaml` на список не влияют. Файл вопросов читается, когда в списке есть A2 или B.
+
+В конце процесса печатается строка `run complete documents=… questions=… error_rate=…`.
+
+Ответы:
+
+- `experiments/results/<имя файла>.jsonl` — строки пар «документ × вопрос». Одна тройка моделей даёт свою строку; в ней `embedding_model`, `reranker_model` и `answer_model`. Текст ответа в поле `answer`, признак в `found`, страницы и цитата в `citations` (`page_from`, `page_to`, `section_path`, `quote`).
+- `experiments/results/run_summary.json` — сколько документов и вопросов было в прогоне, счётчики фаз `computed`, `skipped`, `failed` и список `combinations` по тройкам.
+
+Повторный расчёт той же тройки и того же вопроса заменяет прежнюю строку. Строки других троек остаются. Сводка каждый раз пишется заново.
+
+На один запуск можно оставить одну модель роли флагом `--embedding-model`, `--reranker-model` или `--answer-model`. Имя — файл из `models/`. Остальные списки берутся из конфига.
+
+Если поиск ничего не нашёл, модель не вызывается, а в `answer` будет фраза «В поиске по этому вопросу ничего не найдено.»
+
+`failed` у фазы A1 в сводке обычно значит, что файл не разобрался: чаще всего это PDF без текстового слоя.
+
+Первый прогон считает эмбеддинги всех кусков и может идти долго. Следующий запуск с теми же файлами фазы пропускает: в сводке это `skipped`.
+
+## 7. Повторить прогон после правок
+
+Новый файл с новым именем подхватывается следующим запуском сам.
+
+Повторное использование артефактов смотрит на настройки, а не на байты документов, вопросов и GGUF. После замены содержимого при том же имени файла, после правки `questions.json` и после смены файла эмбеддера нужен пересчёт всех трёх фаз:
+
+```bash
+docker compose exec app python main.py run --config config.yaml \
+  --force-phase A1 --force-phase A2 --force-phase B
+```
+
+После смены только реранкера достаточно `--force-phase A2 --force-phase B`. После смены только модели ответа — `--force-phase B`.
+
+Флаги можно повторять. Один `--force-phase A1` обновляет индекс и не переписывает уже сохранённые ответы.
+
+## Ограничения этого запуска
+
+Точка входа — команда `python main.py run`. Верификатор в прогон не входит. `python main.py eval` группирует уже записанные ответы по тройке моделей и печатает JSON-массив отчётов. Формулы Recall, nDCG и exact match в этот отчёт ещё не входят.
+
+## Тесты
+
+Из корня на хосте, при запущенном контейнере `app`:
+
+```bash
+docker compose exec app python -m pytest tests
+```
+
+Внутри контейнера: `python -m pytest tests`.

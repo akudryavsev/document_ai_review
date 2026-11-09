@@ -1,10 +1,16 @@
-# Пример конфига для проверки разбора документов на чанки (фаза A1).
-# Всё для экспериментов лежит в ./experiments/ (каталог в .gitignore).
-# Документы: положите .docx / .pdf в ./experiments/documents
-# Запуск: python main.py run --config config.yaml --phase A1
+# Рабочий пример прогона. Документы и вопросы лежат в ./experiments/ (каталог в .gitignore).
+# Имена в embedding.models, reranker.models и answer.models — файлы в models/, с суффиксом .gguf.
+# Команда run до любой фазы проверяет, что каждый файл из трёх списков есть в models/.
+# Для этого примера нужны models/embed.gguf, models/rerank.gguf и models/answer.gguf.
+# Фаза A1 считает эмбеддинги кусков файлом из embedding.models, поэтому без него она не стартует.
 #
-# Вопросы для одного A1 не нужны (см. docs/specs/1. top-level-classes.md).
-# Путь questions_file оставлен для полных прогонов A2/B.
+# Список фаз задаёт --phase. Без флага выполняются A1,A2,B.
+# Поля phases.run_a1, run_a2 и run_b команда не читает.
+# experiments/questions.json читается, когда в --phase есть A2 или B.
+#
+# Из контейнера app:
+#   python main.py run --config config.yaml
+#   python main.py run --config config.yaml --phase A1 --force-phase A1
 
 input:
   documents_dir: "./experiments/documents"
@@ -26,12 +32,11 @@ inference:
   poll_interval_sec: 0.5
 
 embedding:
-  model: "embed"
+  models:
+    - embed.gguf
   batch_size: 8
   dtype: "fp16"
   device: "cuda:0"
-  cache_dir: "./experiments/emb"
-  questions_cache: "./experiments/questions.parquet"
   persist_chunk_index: true
   persist_bm25: false
 
@@ -48,7 +53,8 @@ retrieval:
 
 reranker:
   enabled: true
-  model: "rerank"
+  models:
+    - rerank.gguf
   top_n: 5
   # 0 — в сборку всегда top_n лучших. Поднять для отсечения слабых скоров.
   score_threshold: 0
@@ -70,16 +76,18 @@ context:
   compression: none
 
 answer:
-  model: "answer"
+  models:
+    - answer.gguf
   device: "auto"
   temperature: 0
   max_output_tokens: 800
   require_citations: true
 
 phases:
+  # Флаги run_* прогон не читает. Фазы задаёт --phase.
   run_a1: true
-  run_a2: false
-  run_b: false
+  run_a2: true
+  run_b: true
   contexts_dir: "./experiments/contexts"
   index_dir: "./experiments/index"
   skip_if_artifacts_valid: true
@@ -90,5 +98,6 @@ runtime:
   question_parallelism: 1
   results_dir: "./experiments/results"
   log_level: "INFO"
-  # Корень артефактов A1 и debug: emb/, debug/, questions.*
+  # Корень чанков, эмбеддингов вопросов, embed_cache, meta ответов и debug.
+  # Куски документа: experiments/emb/<файл эмбеддера>/<имя документа>/
   cache_dir: "./experiments"

@@ -14,6 +14,7 @@ from ports.sources import DocumentSource, QuestionSource
 from ports.trace import TraceSink
 from gpu import GpuLease
 from runs.analysis import AnalysisRun
+from runs.evaluation import EvaluationRun
 
 
 class DocumentAnalysisService:
@@ -87,21 +88,19 @@ class DocumentAnalysisService:
         )
         return analysis.execute()
 
-    def evaluate(self, request: EvalRequest) -> EvalReport:
-        """Оболочка eval до отдельной спецификации метрик.
+    def evaluate(self, request: EvalRequest) -> list[EvalReport]:
+        """Группирует предсказания по тройке моделей.
 
         Args:
             request: EvalRequest.
 
         Returns:
-            EvalReport-заглушка.
+            Список EvalReport, по отчёту на тройку.
 
         Raises:
-            NotImplementedError: Метрики отложены спецификацией eval.
+            EvaluationError: Строка или эталон не прошли проверку до отчёта.
         """
-        raise NotImplementedError(
-            "EvaluationRun появится после спецификации eval"
-        )
+        return EvaluationRun().execute(request)
 
     def _load_questions(self, request: RunRequest) -> QuestionSet | None:
         """Загружает вопросы, если в прогоне есть поиск или ответы.

@@ -24,19 +24,35 @@ class PhaseCounters(BaseModel):
 
 
 class ModelVersions(BaseModel):
-    """Версии моделей прогона.
+    """Имена файлов, которые обошёл прогон.
 
     Attributes:
-        embedding: Эмбеддер.
-        reranker: Реранкер.
-        answer: LLM ответа.
-        verification: Модель верификации.
+        embedding: Эмбеддеры в порядке конфига.
+        reranker: Реранкеры в порядке конфига.
+        answer: Модели ответа в порядке конфига.
+        verification: Модель верификации. В цикл не входит.
     """
 
-    embedding: str = ""
-    reranker: str = ""
-    answer: str = ""
+    embedding: list[str] = Field(default_factory=list)
+    reranker: list[str] = Field(default_factory=list)
+    answer: list[str] = Field(default_factory=list)
     verification: str = ""
+
+
+class CombinationSummary(BaseModel):
+    """Счётчики одной тройки моделей.
+
+    Attributes:
+        embedding_model: Имя файла эмбеддера.
+        reranker_model: Имя файла реранкера.
+        answer_model: Имя файла модели ответа.
+        phases: Счётчики фаз, запрошенных для этой тройки.
+    """
+
+    embedding_model: str
+    reranker_model: str
+    answer_model: str
+    phases: dict[PhaseName, PhaseCounters] = Field(default_factory=dict)
 
 
 class RunSummary(BaseModel):
@@ -49,8 +65,9 @@ class RunSummary(BaseModel):
         average_latency_ms: Средняя latency ответа.
         average_prompt_tokens: Средние токены промпта.
         average_completion_tokens: Средние токены ответа.
-        model_versions: Версии моделей.
-        phases: Счётчики по каждой запрошенной фазе.
+        model_versions: Списки имён файлов прогона.
+        combinations: Тройки в порядке цикла.
+        phases: Суммарные счётчики по каждой запрошенной фазе.
         requested_phases: Фазы, которые были запрошены.
         details: Дополнительные детали failures.
     """
@@ -62,6 +79,7 @@ class RunSummary(BaseModel):
     average_prompt_tokens: float = 0.0
     average_completion_tokens: float = 0.0
     model_versions: ModelVersions = Field(default_factory=ModelVersions)
+    combinations: list[CombinationSummary] = Field(default_factory=list)
     phases: dict[PhaseName, PhaseCounters] = Field(default_factory=dict)
     requested_phases: list[PhaseName] = Field(default_factory=list)
     details: dict[str, Any] = Field(default_factory=dict)
@@ -85,16 +103,34 @@ class RunSummary(BaseModel):
 
 
 class EvalReport(BaseModel):
-    """Оболочка отчёта eval до отдельной спецификации метрик.
+    """Отчёт одной тройки моделей.
 
     Attributes:
+        embedding_model: Эмбеддер группы.
+        reranker_model: Реранкер группы.
+        answer_model: Модель ответа группы.
+        cosine_embedding_model: Первый эмбеддер конфига для косинуса.
         ground_truth_path: Путь к gt.json.
         predictions_dir: Каталог предсказаний.
-        metrics: Зарезервировано под будущие метрики.
-        note: Пометка об отложенной спеке eval.
+        index_dir: Корень кандидатов.
+        contexts_dir: Корень контекстов.
+        n_matched: Число сопоставленных пар эталона и группы.
+        n_missing_candidates: Пары без файла кандидатов по префиксу тройки.
+        candidates_path: Путь кандидатов первой сопоставленной пары.
+        metrics: Зарезервировано под формулы спеки eval.
+        note: Пометка о формулах, которые считает отдельная спека eval.
     """
 
+    embedding_model: str = ""
+    reranker_model: str = ""
+    answer_model: str = ""
+    cosine_embedding_model: str = ""
     ground_truth_path: str = ""
     predictions_dir: str = ""
+    index_dir: str = ""
+    contexts_dir: str = ""
+    n_matched: int = 0
+    n_missing_candidates: int = 0
+    candidates_path: str = ""
     metrics: dict[str, Any] = Field(default_factory=dict)
-    note: str = "Состав метрик уточняется в спецификации eval"
+    note: str = "Формулы метрик задаёт спецификация eval"

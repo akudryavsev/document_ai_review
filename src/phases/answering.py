@@ -134,6 +134,7 @@ class AnsweringPhase(Phase):
                 if bundle is None:
                     pair_failures += 1
                     doc_failed = True
+                    answer_name = context.config.answer.model or ""
                     record = AnswerRecord(
                         doc_id=doc_id,
                         question_id=question.id,
@@ -142,6 +143,10 @@ class AnsweringPhase(Phase):
                         answer="",
                         reason="missing_context",
                         status="failed",
+                        model=answer_name,
+                        embedding_model=context.config.embedding.model or "",
+                        reranker_model=context.config.reranker.model or "",
+                        answer_model=answer_name,
                     )
                     self.result_sink.write_answer(record)
                     continue
